@@ -1,0 +1,47 @@
+# Rust / Cargo
+/target/
+**/target/
+**/*.rs.bk
+**/.cargo-ok
+*.orig
+**/*.orig
+**/*.log
+
+# Production build outputs
+/dist/
+**/dist/
+
+# Patched dependencies (only patch files are tracked)
+/patches/gpui-component/
+
+# Local tools and caching
+.tools/
+**/.tools/
+.antigravitycli/
+**/.antigravitycli/
+
+# Auto-generated app state
+/dashboard_state.yaml
+
+# Zig build cache & outputs
+.zig-cache/
+zig-cache/
+zig-out/
+**/.zig-cache/
+**/zig-cache/
+**/zig-out/
+
+# OS-specific files
+.DS_Store
+**/.DS_Store
+Thumbs.db
+**/Thumbs.db
+
+# IDE configurations
+.vscode/
+**/.vscode/
+.idea/
+**/.idea/
+*.swp
+*.swo
+
