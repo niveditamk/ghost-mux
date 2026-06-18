@@ -159,12 +159,18 @@ struct MemorySnapshot {
     shells_rss_kb: u64,
 }
 
+pub struct BrowserState {
+    pub url_editor: Entity<InputState>,
+    pub handle: Option<std::rc::Rc<crate::browser::WebViewHandle>>,
+}
+
 pub struct DashboardView {
     pub dashboards: HashMap<usize, DashboardState>,
     pub dashboard_order: Vec<usize>,
     pub active_dashboard_id: usize,
     pub terminals: HashMap<usize, Entity<TerminalModel>>,
     pub editors: HashMap<usize, Entity<InputState>>,
+    pub browsers: HashMap<usize, BrowserState>,
     /// Externally-owned ResizableState entities, keyed by split-node ID.
     /// Keeping them here (not inside the window keyed state) ensures that
     /// panel sizes survive dashboard switching.
@@ -227,6 +233,7 @@ impl DashboardView {
             active_dashboard_id: 0,
             terminals: HashMap::new(),
             editors: HashMap::new(),
+            browsers: HashMap::new(),
             resizable_states: HashMap::new(),
             pending_split_ratios: HashMap::new(),
             resizable_subscriptions: HashMap::new(),
@@ -875,6 +882,62 @@ impl DashboardView {
             PanelContent::Git => {
                 self.refresh_git_diff(tab_id, cx);
             }
+            PanelContent::Browser { url } => {
+                if !self.browsers.contains_key(&tab_id) {
+                    let editor = cx.new(|cx| {
+                        let mut e = InputState::new(window, cx)
+                            .multi_line(false);
+                        e.set_value(url.clone(), window, cx);
+                        e
+                    });
+                    
+                    cx.subscribe(&editor, move |this, editor, event, cx| {
+                        if let gpui_component::input::InputEvent::PressEnter { .. } = event {
+                            let new_url = editor.read(cx).value().to_string();
+                            this.navigate_browser(tab_id, &new_url, cx);
+                        }
+                    }).detach();
+                    
+                    let (tx, rx) = std::sync::mpsc::channel::<String>();
+                    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+                    let handle = crate::browser::WebViewHandle::new(
+                        window,
+                        &url,
+                        Box::new(move |new_url: String| {
+                            let _ = tx.send(new_url);
+                        }),
+                    ).map(std::rc::Rc::new);
+
+                    let entity = cx.weak_entity();
+                    let window_handle = window.window_handle();
+                    let tab_id_clone = tab_id;
+                    cx.spawn(async move |_entity, cx| {
+                        loop {
+                            let rx_clone = rx.clone();
+                            let res: Option<String> = cx.background_executor().spawn(async move {
+                                rx_clone.lock().unwrap().recv().ok()
+                            }).await;
+                            
+                            if let Some(new_url) = res {
+                                let _ = cx.update(|cx| {
+                                    let _ = cx.update_window(window_handle, |_, window, cx| {
+                                        let _ = entity.update(cx, |this, cx| {
+                                            this.on_browser_url_changed(tab_id_clone, &new_url, window, cx);
+                                        });
+                                    });
+                                });
+                            } else {
+                                break;
+                            }
+                        }
+                    }).detach();
+
+                    self.browsers.insert(tab_id, BrowserState {
+                        url_editor: editor,
+                        handle,
+                    });
+                }
+            }
             PanelContent::Editor { path, is_diff, status } => {
                 if !self.editors.contains_key(&tab_id) {
                     let editor = if is_diff {
@@ -906,6 +969,72 @@ impl DashboardView {
                     };
                     self.editors.insert(tab_id, editor);
                 }
+            }
+        }
+    }
+
+    pub fn navigate_browser(&mut self, tab_id: usize, url: &str, cx: &mut Context<Self>) {
+        if let Some(browser) = self.browsers.get_mut(&tab_id) {
+            if let Some(ref handle) = browser.handle {
+                handle.load_url(url);
+            }
+            self.update_browser_tab_url(tab_id, url, cx);
+        }
+    }
+
+    fn update_browser_tab_url(&mut self, tab_id: usize, url: &str, cx: &mut Context<Self>) {
+        for state in self.dashboards.values_mut() {
+            for panel_tabs in state.panel_tabs.values_mut() {
+                for tab in &mut panel_tabs.tabs {
+                    if tab.id == tab_id {
+                        if let PanelContent::Browser { url: ref mut tab_url } = tab.content {
+                            *tab_url = url.to_string();
+                            self.persist(cx);
+                            cx.notify();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn on_browser_url_changed(&mut self, tab_id: usize, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(browser) = self.browsers.get_mut(&tab_id) {
+            browser.url_editor.update(cx, |editor, cx| {
+                editor.set_value(url.to_string(), window, cx);
+            });
+            self.update_browser_tab_url(tab_id, url, cx);
+        }
+    }
+
+    fn hide_inactive_browsers(&self) {
+        let active_dashboard = match self.dashboards.get(&self.active_dashboard_id) {
+            Some(d) => d,
+            None => {
+                for browser in self.browsers.values() {
+                    if let Some(ref handle) = browser.handle {
+                        handle.set_visible(false);
+                    }
+                }
+                return;
+            }
+        };
+
+        for (&tab_id, browser) in &self.browsers {
+            let mut is_active = false;
+            for panel_tabs in active_dashboard.panel_tabs.values() {
+                if let Some(active_tab) = panel_tabs.tabs.get(panel_tabs.active_tab) {
+                    if active_tab.id == tab_id {
+                        if let PanelContent::Browser { .. } = active_tab.content {
+                            is_active = true;
+                        }
+                    }
+                }
+            }
+
+            if let Some(ref handle) = browser.handle {
+                handle.set_visible(is_active);
             }
         }
     }
@@ -969,6 +1098,7 @@ impl DashboardView {
         if let Some(tab_id) = removed_tab_id {
             self.terminals.remove(&tab_id);
             self.editors.remove(&tab_id);
+            self.browsers.remove(&tab_id);
             self.terminal_cwds.remove(&tab_id);
             self.expanded_paths.remove(&tab_id);
             self.git_diffs.remove(&tab_id);
@@ -1121,6 +1251,7 @@ impl DashboardView {
             for tab in removed_tabs {
                 self.terminals.remove(&tab.id);
                 self.editors.remove(&tab.id);
+                self.browsers.remove(&tab.id);
             }
             self.panel_focus_handles.remove(&panel_id);
             self.persist(cx);
@@ -1281,6 +1412,7 @@ impl DashboardView {
             .track_focus(&focus_handle)
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 window.focus(&fh_click, cx);
+                crate::browser::restore_gpui_focus(window);
             })
             .child(
                 div()
@@ -1296,6 +1428,7 @@ impl DashboardView {
                         dashboard.current_dir.clone(),
                         &self.terminals,
                         &self.editors,
+                        &self.browsers,
                         &self.terminal_cwds,
                         &self.expanded_paths,
                         &self.git_diffs,
@@ -1368,6 +1501,7 @@ impl DashboardView {
                 let focus_handle = editor.focus_handle(cx);
                 window.on_next_frame(move |window, cx| {
                     window.focus(&focus_handle, cx);
+                    crate::browser::restore_gpui_focus(window);
                 });
                 self.modal_editor = Some(ModalEditorState {
                     path,
@@ -1503,6 +1637,7 @@ impl DashboardView {
             let focus_handle = editor.focus_handle(cx);
             window.on_next_frame(move |window, cx| {
                 window.focus(&focus_handle, cx);
+                crate::browser::restore_gpui_focus(window);
             });
             self.modal_editor = Some(ModalEditorState {
                 path,
@@ -1566,6 +1701,7 @@ impl DashboardView {
                             let focus_handle = editor.focus_handle(cx);
                             window.on_next_frame(move |window, cx| {
                                 window.focus(&focus_handle, cx);
+                                crate::browser::restore_gpui_focus(window);
                             });
                         }
                     }
@@ -1637,6 +1773,7 @@ impl DashboardView {
         let focus_handle = editor.focus_handle(cx);
         window.on_next_frame(move |window, cx| {
             window.focus(&focus_handle, cx);
+            crate::browser::restore_gpui_focus(window);
         });
 
         self.persist(cx);
@@ -1671,6 +1808,7 @@ impl DashboardView {
 
 impl Render for DashboardView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.hide_inactive_browsers();
         let active = self
             .active_dashboard()
             .map(|dashboard| (dashboard.id, dashboard.layout.clone(), dashboard.title.clone()));
@@ -2490,6 +2628,19 @@ fn panel_header(
                 PanelContent::Terminal => "terminal".to_string(),
                 PanelContent::FileExplorer => "explorer".to_string(),
                 PanelContent::Git => "git".to_string(),
+                PanelContent::Browser { url } => {
+                    if url.is_empty() {
+                        "browser".to_string()
+                    } else {
+                        url.trim_start_matches("https://")
+                            .trim_start_matches("http://")
+                            .trim_start_matches("www.")
+                            .split('/')
+                            .next()
+                            .unwrap_or(url)
+                            .to_string()
+                    }
+                }
                 PanelContent::Editor { path, is_diff, .. } => {
                     let name = path.file_name()
                         .map(|n| n.to_string_lossy().to_string())
@@ -2622,6 +2773,23 @@ fn panel_header(
                                     theme
                                 )
                             )
+                            .child(
+                                dropdown_item(
+                                    ElementId::Integer(2_300_000 + tab.id as u64 * 10 + 4),
+                                    "Browser",
+                                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                        this.open_menu = None;
+                                        this.set_panel_tab_content(
+                                            dashboard_id,
+                                            panel_id,
+                                            PanelContent::Browser { url: "https://google.com".to_string() },
+                                            window,
+                                            cx
+                                        );
+                                    }),
+                                    theme
+                                )
+                            )
                     )
                 } else {
                     None
@@ -2743,6 +2911,30 @@ fn action_icon_button(
         })
         .on_click(handler)
         .child(Icon::new(icon).size_3())
+}
+
+fn browser_nav_button(
+    eid: ElementId,
+    label: &'static str,
+    settings: &LayoutSettings,
+    theme: &gpui_component::theme::Theme,
+    handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(eid)
+        .h(px(settings.icon_button_height))
+        .w(px(settings.icon_button_height))
+        .rounded_sm()
+        .bg(theme.background)
+        .border_1()
+        .border_color(theme.border)
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(theme.muted_foreground)
+        .hover(move |s| s.bg(theme.muted).text_color(theme.foreground))
+        .on_click(handler)
+        .child(label)
 }
 
 fn action_text_button(
@@ -3026,6 +3218,7 @@ fn render_panel_content(
     dashboard_cwd: PathBuf,
     terminals: &HashMap<usize, Entity<TerminalModel>>,
     editors: &HashMap<usize, Entity<InputState>>,
+    browsers: &HashMap<usize, BrowserState>,
     terminal_cwds: &HashMap<usize, PathBuf>,
     expanded_paths: &HashMap<usize, std::collections::HashSet<PathBuf>>,
     git_diffs: &HashMap<usize, GitDiffState>,
@@ -3082,6 +3275,113 @@ fn render_panel_content(
                 render_panel_editor(id, &path, editor, is_diff, status.as_deref(), git_diff_side_by_side, git_diff_wrap, git_diff_scroll_handles, git_diff_div_scroll_handles, layout_settings, window, cx)
             } else {
                 div().flex_1().child("No editor").into_any_element()
+            }
+        }
+        PanelContent::Browser { .. } => {
+            if let Some(state) = browsers.get(&id) {
+                let theme = cx.theme();
+                let handle_opt = state.handle.clone();
+                let tab_id = id;
+
+                let toolbar = div()
+                    .h(px(32.0))
+                    .bg(theme.secondary)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .gap_2()
+                    .child(
+                        browser_nav_button(
+                            ElementId::Integer(950_000 + tab_id as u64 * 10 + 1),
+                            "←",
+                            layout_settings,
+                            theme,
+                            cx.listener(move |this, _, _, _| {
+                                if let Some(ref b) = this.browsers.get(&tab_id) {
+                                    if let Some(ref h) = b.handle {
+                                        h.go_back();
+                                    }
+                                }
+                            })
+                        )
+                    )
+                    .child(
+                        browser_nav_button(
+                            ElementId::Integer(950_000 + tab_id as u64 * 10 + 2),
+                            "→",
+                            layout_settings,
+                            theme,
+                            cx.listener(move |this, _, _, _| {
+                                if let Some(ref b) = this.browsers.get(&tab_id) {
+                                    if let Some(ref h) = b.handle {
+                                        h.go_forward();
+                                    }
+                                }
+                            })
+                        )
+                    )
+                    .child(
+                        browser_nav_button(
+                            ElementId::Integer(950_000 + tab_id as u64 * 10 + 3),
+                            "↻",
+                            layout_settings,
+                            theme,
+                            cx.listener(move |this, _, _, _| {
+                                if let Some(ref b) = this.browsers.get(&tab_id) {
+                                    if let Some(ref h) = b.handle {
+                                        h.reload();
+                                    }
+                                }
+                            })
+                        )
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(24.0))
+                            .on_mouse_down(MouseButton::Left, {
+                                let focus_handle = state.url_editor.focus_handle(cx);
+                                move |_, window, cx| {
+                                    window.focus(&focus_handle, cx);
+                                    crate::browser::restore_gpui_focus(window);
+                                    cx.stop_propagation();
+                                }
+                            })
+                            .child(
+                                Input::new(&state.url_editor)
+                                    .h_full()
+                                    .font_family(theme.mono_font_family.clone())
+                                    .text_size(theme.mono_font_size)
+                                    .font_normal()
+                            )
+                    );
+
+                let body = div()
+                    .flex_1()
+                    .child(
+                        canvas(
+                            move |bounds, _, _| bounds,
+                            move |bounds, _prepaint_val, window, _cx| {
+                                if let Some(ref h) = handle_opt {
+                                    h.set_bounds(window, bounds);
+                                    h.set_visible(true);
+                                }
+                            }
+                        )
+                        .size_full()
+                    );
+
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(toolbar)
+                    .child(body)
+                    .into_any_element()
+            } else {
+                div().flex_1().child("No browser state").into_any_element()
             }
         }
     }
@@ -3662,9 +3962,11 @@ fn render_terminal(
         .track_focus(&focus_handle)
         .on_click(move |_, window, cx| {
             window.focus(&fh_click, cx);
+            crate::browser::restore_gpui_focus(window);
         })
         .on_mouse_down(MouseButton::Left, move |event, window, cx| {
             window.focus(&fh_click_mouse_down, cx);
+            crate::browser::restore_gpui_focus(window);
             term_entity_select_start.update(cx, |m, inner_cx| {
                 if let Some((row, col)) = terminal_position_to_cell(
                     event.position,
@@ -4747,6 +5049,7 @@ fn content_title(content: &PanelContent) -> String {
         PanelContent::Terminal => "terminal".to_string(),
         PanelContent::FileExplorer => "explorer".to_string(),
         PanelContent::Git => "git".to_string(),
+        PanelContent::Browser { .. } => "browser".to_string(),
         PanelContent::Editor { path, is_diff, .. } => {
             let name = path.file_name()
                 .map(|n| n.to_string_lossy().to_string())

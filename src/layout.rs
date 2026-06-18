@@ -125,6 +125,9 @@ pub enum PanelContent {
     Terminal,
     FileExplorer,
     Git,
+    Browser {
+        url: String,
+    },
     Editor {
         path: PathBuf,
         is_diff: bool,

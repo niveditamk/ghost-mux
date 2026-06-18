@@ -2235,7 +2235,9 @@ dependencies = [
  "libc",
  "libghostty-vt",
  "libghostty-vt-sys",
+ "objc",
  "portable-pty",
+ "raw-window-handle",
  "serde",
  "serde_yaml",
 ]

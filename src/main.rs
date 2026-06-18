@@ -1,3 +1,4 @@
+mod browser;
 mod dashboard;
 mod layout;
 mod persist;
@@ -60,3 +61,4 @@ fn main() {
         .detach();
     });
 }
+

@@ -25,6 +25,9 @@ pub enum SerPanelContent {
     },
     FileExplorer,
     Git,
+    Browser {
+        url: String,
+    },
 }
 
 impl From<PanelContent> for SerPanelContent {
@@ -33,6 +36,7 @@ impl From<PanelContent> for SerPanelContent {
             PanelContent::Terminal => SerPanelContent::Terminal,
             PanelContent::FileExplorer => SerPanelContent::FileExplorer,
             PanelContent::Git => SerPanelContent::Git,
+            PanelContent::Browser { url } => SerPanelContent::Browser { url },
             PanelContent::Editor { path, is_diff, status } => SerPanelContent::Editor { path, is_diff, status },
         }
     }
@@ -45,6 +49,7 @@ impl From<SerPanelContent> for PanelContent {
             SerPanelContent::Editor { path, is_diff, status } => PanelContent::Editor { path, is_diff, status },
             SerPanelContent::FileExplorer => PanelContent::FileExplorer,
             SerPanelContent::Git => PanelContent::Git,
+            SerPanelContent::Browser { url } => PanelContent::Browser { url },
         }
     }
 }
