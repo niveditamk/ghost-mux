@@ -19,6 +19,15 @@ use crate::persist::{
 use crate::settings::{AppSettings, LayoutSettings, TerminalSettings};
 use crate::terminal::{TerminalModel, TerminalShiftTab, TerminalTab};
 
+actions!(editor, [SaveFile]);
+
+pub fn register_bindings(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-s", SaveFile, Some("Input")),
+        KeyBinding::new("cmd-s", SaveFile, Some("Input")),
+    ]);
+}
+
 #[derive(Clone, Debug)]
 pub struct PanelTab {
     pub id: usize,
@@ -164,6 +173,64 @@ pub struct BrowserState {
     pub handle: Option<std::rc::Rc<crate::browser::WebViewHandle>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExplorerEditType {
+    CreateFile { parent_path: PathBuf },
+    CreateFolder { parent_path: PathBuf },
+    Rename { path: PathBuf },
+}
+
+pub struct ExplorerEditState {
+    pub tab_id: usize,
+    pub edit_type: ExplorerEditType,
+    pub input_state: Entity<InputState>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExplorerContextMenu {
+    pub tab_id: usize,
+    pub path: Option<PathBuf>,
+    pub position: gpui::Point<gpui::Pixels>,
+    pub is_root: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct ExplorerDragItem {
+    pub tab_id: usize,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub name: String,
+}
+
+impl Render for ExplorerDragItem {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let icon_name = if self.is_dir {
+            IconName::Folder
+        } else {
+            IconName::File
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .bg(theme.accent)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(theme.radius)
+            .py_1()
+            .px_3()
+            .child(Icon::new(icon_name).size_3p5().text_color(theme.foreground))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.foreground)
+                    .child(self.name.clone())
+            )
+    }
+}
+
 pub struct DashboardView {
     pub dashboards: HashMap<usize, DashboardState>,
     pub dashboard_order: Vec<usize>,
@@ -203,8 +270,14 @@ pub struct DashboardView {
     pub next_id: usize,
     pub modal_editor: Option<ModalEditorState>,
     pub editor_panels: std::collections::HashSet<usize>,
-    pub panel_focus_handles: HashMap<usize, FocusHandle>,
     pub open_menu: Option<(usize, usize)>, // (panel_id, tab_idx)
+    pub panel_focus_handles: HashMap<usize, FocusHandle>,
+    pub hook_port: Option<u16>,
+    pub hook_receiver: Option<std::sync::mpsc::Receiver<crate::hook_server::HookEvent>>,
+    pub explorer_edit: Option<ExplorerEditState>,
+    pub explorer_context_menu: Option<ExplorerContextMenu>,
+    pub original_contents: HashMap<usize, String>,
+    pub editor_subscriptions: HashMap<usize, Subscription>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -260,7 +333,24 @@ impl DashboardView {
             editor_panels: std::collections::HashSet::new(),
             panel_focus_handles: HashMap::new(),
             open_menu: None,
+            hook_port: None,
+            hook_receiver: None,
+            explorer_edit: None,
+            explorer_context_menu: None,
+            original_contents: HashMap::new(),
+            editor_subscriptions: HashMap::new(),
         };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let hook_port = crate::hook_server::start_hook_server(tx);
+        if let Some(port) = hook_port {
+            eprintln!("GHOST_MUX_HOOK_PORT={}", port);
+        }
+        if let Err(err) = crate::hook_server::setup_agent_hooks(&view.settings.agents) {
+            eprintln!("Failed to setup agent hooks: {:#}", err);
+        }
+        view.hook_port = hook_port;
+        view.hook_receiver = Some(rx);
 
         // Try to restore previously-saved layout. Fall back to a fresh dashboard.
         let restored = if persist_path.exists() {
@@ -542,6 +632,8 @@ impl DashboardView {
                 for tab in &panel.tabs {
                     self.terminals.remove(&tab.id);
                     self.editors.remove(&tab.id);
+                    self.original_contents.remove(&tab.id);
+                    self.editor_subscriptions.remove(&tab.id);
                 }
             }
         }
@@ -673,6 +765,44 @@ impl DashboardView {
     }
 
     fn refresh_terminal_memory(&mut self, cx: &mut Context<Self>) {
+        let mut attention_changed = false;
+        if let Some(ref rx) = self.hook_receiver {
+            while let Ok(event) = rx.try_recv() {
+                if let Some(terminal) = self.terminals.get(&event.terminal_id) {
+                    let ev_type = event.event_type.clone();
+                    terminal.update(cx, |m, _| {
+                        match ev_type.as_str() {
+                            "Start" => {
+                                m.process_ongoing = true;
+                                m.needs_attention = false;
+                                m.job_done = false;
+                            }
+                            "Stop" => {
+                                m.process_ongoing = false;
+                                m.job_done = true;
+                                m.needs_attention = false;
+                                m.running_agent = None;
+                            }
+                            "PermissionRequest" => {
+                                m.process_ongoing = true;
+                                m.needs_attention = true;
+                                m.job_done = false;
+                            }
+                            _ => {}
+                        }
+                    });
+                    attention_changed = true;
+                    if ev_type == "PermissionRequest" {
+                        let notification_msg = format!("Terminal Tab {} is requesting attention/permission.", event.terminal_id);
+                        send_desktop_notification("Ghost-mux Attention Needed", &notification_msg);
+                    } else if ev_type == "Stop" {
+                        let notification_msg = format!("Terminal Tab {} task has completed.", event.terminal_id);
+                        send_desktop_notification("Ghost-mux Task Completed", &notification_msg);
+                    }
+                }
+            }
+        }
+
         let mut updated = HashMap::new();
         let mut cwds = HashMap::new();
         for (tab_id, terminal) in &self.terminals {
@@ -688,7 +818,6 @@ impl DashboardView {
 
         let shell_pids: Vec<u32> = self.terminals.values().filter_map(|t| t.read(cx).shell_pid()).collect();
         let descendants_map = get_all_terminal_descendants(&shell_pids);
-        let mut attention_changed = false;
 
         for (tab_id, terminal) in &self.terminals {
             let mut check_needs_attention = false;
@@ -736,10 +865,17 @@ impl DashboardView {
             }
 
             let ongoing = has_descendants && !terminal.read(cx).needs_attention;
+            let current_agent = if ongoing && !agent_name.is_empty() {
+                Some(agent_name.clone())
+            } else {
+                None
+            };
             let was_ongoing = terminal.read(cx).process_ongoing;
-            if was_ongoing != ongoing {
+            let was_agent = terminal.read(cx).running_agent.clone();
+            if was_ongoing != ongoing || was_agent != current_agent {
                 terminal.update(cx, |m, _| {
                     m.process_ongoing = ongoing;
+                    m.running_agent = current_agent;
                     if was_ongoing && !ongoing {
                         m.job_done = true;
                     }
@@ -788,12 +924,12 @@ impl DashboardView {
             }
         }
 
-        // Refresh git diffs for active Git tabs
+        // Refresh git diffs for active Git or FileExplorer tabs
         let mut git_tabs_to_refresh = Vec::new();
         for d in self.dashboards.values() {
             for panel in d.panel_tabs.values() {
                 if let Some(active_tab) = panel.tabs.get(panel.active_tab) {
-                    if active_tab.content == PanelContent::Git {
+                    if active_tab.content == PanelContent::Git || active_tab.content == PanelContent::FileExplorer {
                         git_tabs_to_refresh.push(active_tab.id);
                     }
                 }
@@ -947,15 +1083,16 @@ impl DashboardView {
         match content {
             PanelContent::Terminal => {
                 if !self.terminals.contains_key(&tab_id) {
-                    let terminal = cx.new(|cx| TerminalModel::new(cwd, cx));
+                    let terminal = cx.new(|cx| TerminalModel::new(tab_id, self.hook_port, cwd, cx));
                     self.terminals.insert(tab_id, terminal);
                 }
             }
             PanelContent::FileExplorer => {
                 if !self.terminals.contains_key(&tab_id) {
-                    let terminal = cx.new(|cx| TerminalModel::new(cwd, cx));
+                    let terminal = cx.new(|cx| TerminalModel::new(tab_id, self.hook_port, cwd, cx));
                     self.terminals.insert(tab_id, terminal);
                 }
+                self.refresh_git_diff(tab_id, cx);
             }
             PanelContent::Git => {
                 self.refresh_git_diff(tab_id, cx);
@@ -1018,13 +1155,13 @@ impl DashboardView {
             }
             PanelContent::Editor { path, is_diff, status } => {
                 if !self.editors.contains_key(&tab_id) {
-                    let editor = if is_diff {
+                    let (editor, content_str) = if is_diff {
                         let cwd = cwd.clone().unwrap_or_else(|| {
                             std::env::current_dir().unwrap_or_default()
                         });
                         let status_str = status.clone().unwrap_or_default();
                         let diff_content = self.get_file_diff(&path, &status_str, &cwd);
-                        cx.new(|cx| {
+                        let ed = cx.new(|cx| {
                             let mut e = InputState::new(window, cx)
                                 .multi_line(true)
                                 .code_editor("diff")
@@ -1032,20 +1169,32 @@ impl DashboardView {
                                 .disabled(true);
                             e.set_value(diff_content, window, cx);
                             e
-                        })
+                        });
+                        (ed, None)
                     } else {
                         let content = std::fs::read_to_string(&path).unwrap_or_default();
                         let lang = detect_language(&path);
-                        cx.new(|cx| {
+                        let ed = cx.new(|cx| {
                             let mut e = InputState::new(window, cx)
                                 .multi_line(true)
                                 .code_editor(lang)
                                 .line_number(true);
-                            e.set_value(content, window, cx);
+                            e.set_value(content.clone(), window, cx);
                             e
-                        })
+                        });
+                        (ed, Some(content))
                     };
-                    self.editors.insert(tab_id, editor);
+                    self.editors.insert(tab_id, editor.clone());
+                    if let Some(content) = content_str {
+                        self.original_contents.insert(tab_id, content);
+                    }
+
+                    let sub = cx.subscribe(&editor, move |_this, _editor, event, cx| {
+                        if let gpui_component::input::InputEvent::Change = event {
+                            cx.notify();
+                        }
+                    });
+                    self.editor_subscriptions.insert(tab_id, sub);
                 }
             }
         }
@@ -1184,6 +1333,8 @@ impl DashboardView {
             self.git_diff_side_by_side.remove(&tab_id);
             self.git_diff_wrap.remove(&tab_id);
             self.git_collapsed_paths.remove(&tab_id);
+            self.original_contents.remove(&tab_id);
+            self.editor_subscriptions.remove(&tab_id);
             self.persist(cx);
             cx.notify();
         }
@@ -1194,12 +1345,14 @@ impl DashboardView {
         dashboard_id: usize,
         panel_id: usize,
         tab_idx: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.open_menu = None;
         if let Some(dashboard) = self.dashboards.get_mut(&dashboard_id) {
             if let Some(panel) = dashboard.panel_tabs.get_mut(&panel_id) {
-                if tab_idx < panel.tabs.len() && tab_idx != panel.active_tab {
+                if tab_idx < panel.tabs.len() {
+                    let changed = tab_idx != panel.active_tab;
                     panel.active_tab = tab_idx;
                     if let Some(tab) = panel.tabs.get(tab_idx) {
                         if let Some(terminal) = self.terminals.get(&tab.id) {
@@ -1207,9 +1360,22 @@ impl DashboardView {
                                 m.needs_attention = false;
                                 m.job_done = false;
                             });
+                            let focus_handle = terminal.read(cx).focus_handle.clone();
+                            window.on_next_frame(move |window, cx| {
+                                window.focus(&focus_handle, cx);
+                                crate::browser::restore_gpui_focus(window);
+                            });
+                        } else if let Some(editor) = self.editors.get(&tab.id) {
+                            let focus_handle = editor.focus_handle(cx);
+                            window.on_next_frame(move |window, cx| {
+                                window.focus(&focus_handle, cx);
+                                crate::browser::restore_gpui_focus(window);
+                            });
                         }
                     }
-                    self.persist(cx);
+                    if changed {
+                        self.persist(cx);
+                    }
                     cx.notify();
                 }
             }
@@ -1338,6 +1504,8 @@ impl DashboardView {
                 self.terminals.remove(&tab.id);
                 self.editors.remove(&tab.id);
                 self.browsers.remove(&tab.id);
+                self.original_contents.remove(&tab.id);
+                self.editor_subscriptions.remove(&tab.id);
             }
             self.panel_focus_handles.remove(&panel_id);
             self.persist(cx);
@@ -1512,6 +1680,8 @@ impl DashboardView {
                         dashboard_id,
                         panel_id,
                         dashboard.current_dir.clone(),
+                        &self.dashboards,
+                        &self.original_contents,
                         &self.terminals,
                         &self.editors,
                         &self.browsers,
@@ -1526,6 +1696,7 @@ impl DashboardView {
                         &self.git_diff_div_scroll_handles,
                         &self.settings.terminal,
                         &self.settings.layout,
+                        self.explorer_edit.as_ref(),
                         window,
                         cx,
                     ))
@@ -1547,6 +1718,8 @@ impl DashboardView {
                         &self.settings.layout,
                         self.open_menu,
                         &self.terminals,
+                        &self.editors,
+                        &self.original_contents,
                         cx,
                     ))
             )
@@ -1561,6 +1734,128 @@ impl DashboardView {
             expanded.insert(path);
         }
         cx.notify();
+    }
+
+    pub fn move_explorer_item(
+        &mut self,
+        tab_id: usize,
+        source: PathBuf,
+        dest_dir: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if !source.exists() || !dest_dir.is_dir() {
+            return;
+        }
+
+        // Check if destination is same or descendant of source
+        if dest_dir.starts_with(&source) {
+            return;
+        }
+
+        let name = match source.file_name() {
+            Some(n) => n,
+            None => return,
+        };
+
+        let target = dest_dir.join(name);
+        if target == source || target.exists() {
+            return;
+        }
+
+        if let Err(e) = std::fs::rename(&source, &target) {
+            eprintln!("Failed to move item: {:?}", e);
+        } else {
+            self.refresh_git_diff(tab_id, cx);
+            cx.notify();
+        }
+    }
+
+    pub fn start_explorer_edit(
+        &mut self,
+        tab_id: usize,
+        edit_type: ExplorerEditType,
+        initial_value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let select_range = match &edit_type {
+            ExplorerEditType::Rename { path } => {
+                let name = path.file_name().map_or("".to_string(), |n| n.to_string_lossy().to_string());
+                let len = name.len();
+                let dot_pos = if path.is_file() {
+                    name.rfind('.').unwrap_or(len)
+                } else {
+                    len
+                };
+                Some(0..dot_pos)
+            }
+            _ => None,
+        };
+
+        let input_state = cx.new(|cx| {
+            let mut e = InputState::new(window, cx).multi_line(false);
+            e.set_value(initial_value, window, cx);
+            e.focus(window, cx);
+            if let Some(range) = select_range {
+                e.select_text_range(range, cx);
+            }
+            e
+        });
+
+        cx.subscribe(&input_state, move |this, _input, event, cx| {
+            match event {
+                gpui_component::input::InputEvent::PressEnter { .. } | gpui_component::input::InputEvent::Blur => {
+                    this.commit_explorer_edit(cx);
+                }
+                _ => {}
+            }
+        }).detach();
+
+        self.explorer_edit = Some(ExplorerEditState {
+            tab_id,
+            edit_type,
+            input_state,
+        });
+        cx.notify();
+    }
+
+    pub fn commit_explorer_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(edit) = self.explorer_edit.take() {
+            let name = edit.input_state.read(cx).value().to_string().trim().to_string();
+            let tab_id = edit.tab_id;
+            if !name.is_empty() {
+                match edit.edit_type {
+                    ExplorerEditType::CreateFile { parent_path } => {
+                        let new_path = parent_path.join(&name);
+                        if let Err(e) = std::fs::File::create(&new_path) {
+                            eprintln!("Failed to create file: {:?}", e);
+                        } else {
+                            let expanded = self.expanded_paths.entry(tab_id).or_default();
+                            expanded.insert(parent_path);
+                        }
+                    }
+                    ExplorerEditType::CreateFolder { parent_path } => {
+                        let new_path = parent_path.join(&name);
+                        if let Err(e) = std::fs::create_dir_all(&new_path) {
+                            eprintln!("Failed to create folder: {:?}", e);
+                        } else {
+                            let expanded = self.expanded_paths.entry(tab_id).or_default();
+                            expanded.insert(parent_path);
+                        }
+                    }
+                    ExplorerEditType::Rename { path } => {
+                        if let Some(parent) = path.parent() {
+                            let new_path = parent.join(name);
+                            if let Err(e) = std::fs::rename(&path, &new_path) {
+                                eprintln!("Failed to rename: {:?}", e);
+                            }
+                        }
+                    }
+                }
+                self.refresh_git_diff(tab_id, cx);
+            }
+            cx.notify();
+        }
     }
 
     pub fn open_explorer_file(
@@ -1780,20 +2075,7 @@ impl DashboardView {
         }
 
         if let Some(idx) = existing_tab_idx {
-            self.switch_panel_tab(dashboard_id, panel_id, idx, cx);
-            if let Some(dashboard) = self.dashboards.get(&dashboard_id) {
-                if let Some(panel) = dashboard.panel_tabs.get(&panel_id) {
-                    if let Some(tab) = panel.tabs.get(idx) {
-                        if let Some(editor) = self.editors.get(&tab.id) {
-                            let focus_handle = editor.focus_handle(cx);
-                            window.on_next_frame(move |window, cx| {
-                                window.focus(&focus_handle, cx);
-                                crate::browser::restore_gpui_focus(window);
-                            });
-                        }
-                    }
-                }
-            }
+            self.switch_panel_tab(dashboard_id, panel_id, idx, window, cx);
             cx.notify();
             return;
         }
@@ -1813,10 +2095,10 @@ impl DashboardView {
             }
         });
 
-        let editor = if is_diff {
+        let (editor, content_str) = if is_diff {
             let status_str = status.clone().unwrap_or_default();
             let diff_content = self.get_file_diff(&path, &status_str, &cwd);
-            cx.new(|cx| {
+            let ed = cx.new(|cx| {
                 let mut e = InputState::new(window, cx)
                     .multi_line(true)
                     .code_editor("diff")
@@ -1824,21 +2106,33 @@ impl DashboardView {
                     .disabled(true);
                 e.set_value(diff_content, window, cx);
                 e
-            })
+            });
+            (ed, None)
         } else {
             let content = std::fs::read_to_string(&path).unwrap_or_default();
             let lang = detect_language(&path);
-            cx.new(|cx| {
+            let ed = cx.new(|cx| {
                 let mut e = InputState::new(window, cx)
                     .multi_line(true)
                     .code_editor(lang)
                     .line_number(true);
-                e.set_value(content, window, cx);
+                e.set_value(content.clone(), window, cx);
                 e
-            })
+            });
+            (ed, Some(content))
         };
 
         self.editors.insert(tab_id, editor.clone());
+        if let Some(content) = content_str {
+            self.original_contents.insert(tab_id, content);
+        }
+
+        let sub = cx.subscribe(&editor, move |_this, _editor, event, cx| {
+            if let gpui_component::input::InputEvent::Change = event {
+                cx.notify();
+            }
+        });
+        self.editor_subscriptions.insert(tab_id, sub);
 
         let new_tab = PanelTab {
             id: tab_id,
@@ -1885,16 +2179,104 @@ impl DashboardView {
         cx: &mut Context<Self>,
     ) {
         let content = editor.read(cx).text().to_string();
-        if let Err(err) = std::fs::write(path, content) {
+        if let Err(err) = std::fs::write(path, &content) {
             eprintln!("Failed to save file: {:?}", err);
         } else {
             println!("Saved file successfully: {:?}", path);
+            for db in self.dashboards.values() {
+                for panel in db.panel_tabs.values() {
+                    for tab in &panel.tabs {
+                        if let PanelContent::Editor { path: ref p, is_diff: false, .. } = tab.content {
+                            if p == path {
+                                self.original_contents.insert(tab.id, content.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            cx.notify();
         }
+    }
+
+    pub fn render_status_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        
+        let mut modified_files = Vec::new();
+        for db in self.dashboards.values() {
+            for panel in db.panel_tabs.values() {
+                for tab in &panel.tabs {
+                    if let PanelContent::Editor { path: ref p, is_diff: false, .. } = tab.content {
+                        if let Some(editor) = self.editors.get(&tab.id) {
+                            let current_text = editor.read(cx).text().to_string();
+                            if let Some(orig) = self.original_contents.get(&tab.id) {
+                                if &current_text != orig {
+                                    let name = p.file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "editor".to_string());
+                                    modified_files.push(name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let (status_text, status_color) = if modified_files.is_empty() {
+            ("All files saved".to_string(), theme.muted_foreground)
+        } else {
+            (format!("Unsaved changes: {}", modified_files.join(", ")), rgb(0xcca700).into())
+        };
+
+        div()
+            .h(px(22.))
+            .w_full()
+            .px_3()
+            .bg(theme.secondary)
+            .border_t_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .text_size(px(11.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        if !modified_files.is_empty() {
+                            div()
+                                .w(px(6.))
+                                .h(px(6.))
+                                .rounded_full()
+                                .bg(status_color)
+                        } else {
+                            div()
+                                .w(px(6.))
+                                .h(px(6.))
+                                .rounded_full()
+                                .bg(rgb(0x57c994))
+                        }
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.foreground)
+                            .child(status_text)
+                    )
+            )
+            .child(
+                div()
+                    .text_color(theme.muted_foreground)
+                    .child("Ghost-mux")
+            )
+            .into_any_element()
     }
 }
 
 impl Render for DashboardView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.hide_inactive_browsers();
         let active = self
             .active_dashboard()
@@ -1930,7 +2312,8 @@ impl Render for DashboardView {
         };
 
         let main = if let Some((dashboard_id, layout, title)) = active {
-            let layout_el = self.render_layout(dashboard_id, &layout, _window, cx);
+            let layout_el = self.render_layout(dashboard_id, &layout, window, cx);
+            let status_bar_el = self.render_status_bar(window, cx);
             let theme = cx.theme();
             div()
                 .flex_1()
@@ -1963,7 +2346,8 @@ impl Render for DashboardView {
                                 .h_full()
                                 .overflow_hidden()
                                 .child(layout_el),
-                        ),
+                        )
+                        .child(status_bar_el),
                 )
                 .into_any_element()
         } else {
@@ -2010,6 +2394,160 @@ impl Render for DashboardView {
 
         if let Some(ref modal) = self.modal_editor {
             root = root.child(render_modal_editor(&modal.path, &modal.editor, modal.is_diff, self, cx));
+        }
+
+        if let Some(ref menu) = self.explorer_context_menu {
+            let theme = cx.theme();
+            let position = menu.position;
+            let tab_id = menu.tab_id;
+            let path_opt = menu.path.clone();
+            
+            // Build the menu items
+            let is_dir = path_opt.as_ref().map_or(false, |p| p.is_dir());
+            
+            // Clamp menu to screen bounds
+            let window_size = window.bounds().size;
+            let menu_width = px(130.);
+            let menu_height = px(120.);
+            
+            let mut left_pos = position.x;
+            if left_pos + menu_width > window_size.width {
+                left_pos = window_size.width - menu_width;
+            }
+            if left_pos < px(0.) {
+                left_pos = px(0.);
+            }
+            
+            let mut top_pos = position.y;
+            if top_pos + menu_height > window_size.height {
+                top_pos = window_size.height - menu_height;
+            }
+            if top_pos < px(0.) {
+                top_pos = px(0.);
+            }
+            
+            let mut menu_div = div()
+                .absolute()
+                .top(top_pos)
+                .left(left_pos)
+                .bg(theme.background)
+                .border_1()
+                .border_color(theme.border)
+                .rounded_sm()
+                .p_1()
+                .min_w(px(120.))
+                .flex()
+                .flex_col()
+                .shadow_md()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                    cx.stop_propagation();
+                });
+                
+            if let Some(path) = path_opt {
+                if is_dir {
+                    let p_new_file = path.clone();
+                    let p_new_file_2 = p_new_file.clone();
+                    menu_div = menu_div.child(
+                        dropdown_item(
+                            ElementId::Integer(9_000_000 + tab_id as u64 * 10 + 1),
+                            "New File",
+                            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.explorer_context_menu = None;
+                                this.start_explorer_edit(
+                                    tab_id,
+                                    ExplorerEditType::CreateFile { parent_path: p_new_file.clone() },
+                                    "".to_string(),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                            theme
+                        )
+                    ).child(
+                        dropdown_item(
+                            ElementId::Integer(9_000_000 + tab_id as u64 * 10 + 2),
+                            "New Folder",
+                            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.explorer_context_menu = None;
+                                this.start_explorer_edit(
+                                    tab_id,
+                                    ExplorerEditType::CreateFolder { parent_path: p_new_file_2.clone() },
+                                    "".to_string(),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                            theme
+                        )
+                    );
+                }
+                
+                if !menu.is_root {
+                    let p_rename = path.clone();
+                    let initial_name = path.file_name().map_or("".to_string(), |n| n.to_string_lossy().to_string());
+                    menu_div = menu_div.child(
+                        dropdown_item(
+                            ElementId::Integer(9_000_000 + tab_id as u64 * 10 + 3),
+                            "Rename",
+                            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.explorer_context_menu = None;
+                                this.start_explorer_edit(
+                                    tab_id,
+                                    ExplorerEditType::Rename { path: p_rename.clone() },
+                                    initial_name.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                            theme
+                        )
+                    );
+                    
+                    let p_delete = path.clone();
+                    menu_div = menu_div.child(
+                        dropdown_item(
+                            ElementId::Integer(9_000_000 + tab_id as u64 * 10 + 4),
+                            "Delete",
+                            cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                this.explorer_context_menu = None;
+                                if p_delete.is_dir() {
+                                    if let Err(e) = std::fs::remove_dir_all(&p_delete) {
+                                        eprintln!("Failed to delete directory: {:?}", e);
+                                    }
+                                } else {
+                                    if let Err(e) = std::fs::remove_file(&p_delete) {
+                                        eprintln!("Failed to delete file: {:?}", e);
+                                    }
+                                }
+                                this.refresh_git_diff(tab_id, cx);
+                                cx.notify();
+                            }),
+                            theme
+                        )
+                    );
+                }
+            }
+            
+            let catcher = div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.explorer_context_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
+                .on_mouse_down(MouseButton::Right, cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.explorer_context_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }));
+                
+            root = root.child(catcher).child(menu_div);
         }
 
         root.into_any()
@@ -2068,6 +2606,27 @@ fn dashboard_sidebar(view: &DashboardView, cx: &mut Context<DashboardView>) -> A
                 ongoing
             };
 
+            let running_agent_name = {
+                let mut name = None;
+                for panel_tabs in dashboard.panel_tabs.values() {
+                    for tab in &panel_tabs.tabs {
+                        if let Some(terminal) = view.terminals.get(&tab.id) {
+                            let term = terminal.read(cx);
+                            if term.process_ongoing {
+                                if let Some(ref agent) = term.running_agent {
+                                    name = Some(agent.clone());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if name.is_some() {
+                        break;
+                    }
+                }
+                name
+            };
+
             let has_done = {
                 let mut done = false;
                 for panel_tabs in dashboard.panel_tabs.values() {
@@ -2100,10 +2659,20 @@ fn dashboard_sidebar(view: &DashboardView, cx: &mut Context<DashboardView>) -> A
             };
 
             let spinner = if has_ongoing {
+                let element = if let Some(ref agent) = running_agent_name {
+                    Icon::new(agent_icon(agent))
+                        .size_3p5()
+                        .text_color(theme.accent)
+                        .into_any_element()
+                } else {
+                    gpui_component::spinner::Spinner::new()
+                        .xsmall()
+                        .into_any_element()
+                };
                 Some(
                     div()
                         .ml_2()
-                        .child(gpui_component::spinner::Spinner::new().xsmall())
+                        .child(element)
                 )
             } else {
                 None
@@ -2493,13 +3062,14 @@ fn is_llm_cli_agent(cmd: &str) -> bool {
        || lower.contains("gh-copilot")
        || lower.contains("pi-coding-agent")
        || lower.contains("earendil-works/pi")
+       || lower.contains("antigravity")
     {
         return true;
     }
     
     let parts: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_').collect();
     for part in parts {
-        if part == "claude" || part == "pi" {
+        if part == "claude" || part == "pi" || part == "antigravity" {
             return true;
         }
     }
@@ -2520,8 +3090,23 @@ fn extract_agent_name(cmd: &str) -> String {
         "Copilot CLI".to_string()
     } else if lower.contains("pi") {
         "Pi CLI".to_string()
+    } else if lower.contains("antigravity") {
+        "Antigravity".to_string()
     } else {
         "LLM Agent".to_string()
+    }
+}
+
+fn agent_icon(agent: &str) -> IconName {
+    match agent.to_lowercase().as_str() {
+        "claude code" | "claude" => IconName::Claude,
+        "opencode" | "open-code" => IconName::Opencode,
+        "pi cli" | "pi" => IconName::Pi,
+        "aider" => IconName::Aider,
+        "mentat" => IconName::Mentat,
+        "copilot cli" | "copilot" => IconName::Copilot,
+        "antigravity" => IconName::Antigravity,
+        _ => IconName::Bot,
     }
 }
 
@@ -2939,6 +3524,8 @@ fn panel_header(
     settings: &LayoutSettings,
     open_menu: Option<(usize, usize)>,
     terminals: &HashMap<usize, Entity<TerminalModel>>,
+    editors: &HashMap<usize, Entity<InputState>>,
+    original_contents: &HashMap<usize, String>,
     cx: &mut Context<DashboardView>,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -2949,6 +3536,19 @@ fn panel_header(
         .enumerate()
         .map(|(idx, tab)| {
             let is_active = idx == panel_tabs.active_tab;
+            
+            let is_modified = match &tab.content {
+                PanelContent::Editor { is_diff: false, .. } => {
+                    if let Some(editor) = editors.get(&tab.id) {
+                        let current_text = editor.read(cx).text().to_string();
+                        original_contents.get(&tab.id).map_or(false, |orig| orig != &current_text)
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+
             let display_title = match &tab.content {
                 PanelContent::Terminal => "terminal".to_string(),
                 PanelContent::FileExplorer => "explorer".to_string(),
@@ -2994,6 +3594,13 @@ fn panel_header(
                 _ => false,
             };
 
+            let tab_running_agent = match &tab.content {
+                PanelContent::Terminal => {
+                    terminals.get(&tab.id).and_then(|term| term.read(cx).running_agent.clone())
+                }
+                _ => None,
+            };
+
             let tab_job_done = match &tab.content {
                 PanelContent::Terminal => {
                     terminals.get(&tab.id).map_or(false, |term| term.read(cx).job_done)
@@ -3015,10 +3622,20 @@ fn panel_header(
             };
 
             let tab_spinner = if tab_process_ongoing {
+                let element = if let Some(ref agent) = tab_running_agent {
+                    Icon::new(agent_icon(agent))
+                        .size_3p5()
+                        .text_color(theme.accent)
+                        .into_any_element()
+                } else {
+                    gpui_component::spinner::Spinner::new()
+                        .xsmall()
+                        .into_any_element()
+                };
                 Some(
                     div()
                         .ml_1()
-                        .child(gpui_component::spinner::Spinner::new().xsmall())
+                        .child(element)
                 )
             } else {
                 None
@@ -3035,6 +3652,19 @@ fn panel_header(
                 None
             };
 
+            let tab_modified_badge = if is_modified {
+                Some(
+                    div()
+                        .ml_1()
+                        .text_color(rgb(0xcca700))
+                        .font_bold()
+                        .text_xs()
+                        .child("●")
+                )
+            } else {
+                None
+            };
+
             let tab_select = div()
                 .id(ElementId::Integer(2_000_000 + tab.id as u64))
                 .flex_1()
@@ -3044,10 +3674,11 @@ fn panel_header(
                 .items_center()
                 .px_2()
                 .cursor_pointer()
-                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                    this.switch_panel_tab(dashboard_id, panel_id, idx, cx);
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.switch_panel_tab(dashboard_id, panel_id, idx, window, cx);
                 }))
                 .child(div().child(display_title.clone()))
+                .children(tab_modified_badge)
                 .children(tab_badge)
                 .children(tab_spinner)
                 .children(tab_done_badge);
@@ -3367,6 +3998,7 @@ struct ExplorerNode {
     is_dir: bool,
     depth: usize,
     is_expanded: bool,
+    is_editing: bool,
 }
 
 fn build_tree(
@@ -3374,6 +4006,7 @@ fn build_tree(
     depth: usize,
     expanded_paths: &std::collections::HashSet<PathBuf>,
     nodes: &mut Vec<ExplorerNode>,
+    edit_state: Option<&ExplorerEditState>,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -3388,7 +4021,7 @@ fn build_tree(
             let name = entry.file_name().to_string_lossy().into_owned();
 
             // Skip common ignored files/directories to match VS Code and keep it fast
-            if name.starts_with('.') || name == "node_modules" || name == "target" {
+            if name == ".git" || name == ".DS_Store" || name == "node_modules" || name == "target" {
                 continue;
             }
 
@@ -3405,8 +4038,38 @@ fn build_tree(
     dir_entries.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
     file_entries.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
 
+    // Inject temporary folder node if creating a folder under this directory
+    let mut editing_folder = None;
+    let mut editing_file = None;
+    if let Some(edit) = edit_state {
+        match &edit.edit_type {
+            ExplorerEditType::CreateFolder { parent_path } if parent_path == dir => {
+                editing_folder = Some(parent_path.join(""));
+            }
+            ExplorerEditType::CreateFile { parent_path } if parent_path == dir => {
+                editing_file = Some(parent_path.join(""));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(ref path) = editing_folder {
+        nodes.push(ExplorerNode {
+            path: path.clone(),
+            name: "".to_string(),
+            is_dir: true,
+            depth,
+            is_expanded: false,
+            is_editing: true,
+        });
+    }
+
     // Add directories first
     for (path, name) in dir_entries {
+        let is_rename = edit_state.map_or(false, |e| match &e.edit_type {
+            ExplorerEditType::Rename { path: p } => p == &path,
+            _ => false,
+        });
         let is_expanded = expanded_paths.contains(&path);
         nodes.push(ExplorerNode {
             path: path.clone(),
@@ -3414,21 +4077,38 @@ fn build_tree(
             is_dir: true,
             depth,
             is_expanded,
+            is_editing: is_rename,
         });
 
         if is_expanded {
-            build_tree(&path, depth + 1, expanded_paths, nodes);
+            build_tree(&path, depth + 1, expanded_paths, nodes, edit_state);
         }
+    }
+
+    if let Some(ref path) = editing_file {
+        nodes.push(ExplorerNode {
+            path: path.clone(),
+            name: "".to_string(),
+            is_dir: false,
+            depth,
+            is_expanded: false,
+            is_editing: true,
+        });
     }
 
     // Add files
     for (path, name) in file_entries {
+        let is_rename = edit_state.map_or(false, |e| match &e.edit_type {
+            ExplorerEditType::Rename { path: p } => p == &path,
+            _ => false,
+        });
         nodes.push(ExplorerNode {
             path,
             name,
             is_dir: false,
             depth,
             is_expanded: false,
+            is_editing: is_rename,
         });
     }
 }
@@ -3450,6 +4130,40 @@ fn detect_language(path: &std::path::Path) -> &'static str {
     }
 }
 
+fn is_path_modified(
+    path: &std::path::Path,
+    dashboards: &HashMap<usize, DashboardState>,
+    editors: &HashMap<usize, Entity<InputState>>,
+    original_contents: &HashMap<usize, String>,
+    cx: &App,
+) -> bool {
+    let is_dir = path.is_dir();
+    for db in dashboards.values() {
+        for panel in db.panel_tabs.values() {
+            for tab in &panel.tabs {
+                if let PanelContent::Editor { path: ref p, is_diff: false, .. } = tab.content {
+                    let matches = if is_dir {
+                        p.starts_with(path)
+                    } else {
+                        p == path
+                    };
+                    if matches {
+                        if let Some(editor) = editors.get(&tab.id) {
+                            let current_text = editor.read(cx).text().to_string();
+                            if let Some(orig) = original_contents.get(&tab.id) {
+                                if &current_text != orig {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn render_explorer(
     tab_id: usize,
     dashboard_id: usize,
@@ -3457,7 +4171,12 @@ fn render_explorer(
     dashboard_cwd: PathBuf,
     terminal_cwds: &HashMap<usize, PathBuf>,
     expanded_paths: &HashMap<usize, std::collections::HashSet<PathBuf>>,
+    git_diffs: &HashMap<usize, GitDiffState>,
     layout_settings: &LayoutSettings,
+    explorer_edit: Option<&ExplorerEditState>,
+    dashboards: &HashMap<usize, DashboardState>,
+    editors: &HashMap<usize, Entity<InputState>>,
+    original_contents: &HashMap<usize, String>,
     _window: &mut Window,
     cx: &mut Context<DashboardView>,
 ) -> AnyElement {
@@ -3476,8 +4195,10 @@ fn render_explorer(
     let default_expanded = std::collections::HashSet::new();
     let tab_expanded = expanded_paths.get(&tab_id).unwrap_or(&default_expanded);
 
+    let tab_edit = explorer_edit.filter(|e| e.tab_id == tab_id);
+
     let mut nodes = Vec::new();
-    build_tree(&root_path, 0, tab_expanded, &mut nodes);
+    build_tree(&root_path, 0, tab_expanded, &mut nodes, tab_edit);
 
     let items: Vec<AnyElement> = nodes
         .into_iter()
@@ -3485,6 +4206,44 @@ fn render_explorer(
         .map(|(idx, node)| {
             let depth = node.depth;
             let path_for_click = node.path.clone();
+
+            let is_modified = is_path_modified(
+                &node.path,
+                dashboards,
+                editors,
+                original_contents,
+                cx,
+            );
+
+            let git_status = git_diffs.get(&tab_id).and_then(|diff_state| {
+                let relative_path = node.path.strip_prefix(&root_path)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if node.is_dir {
+                    let prefix = format!("{}/", relative_path);
+                    if diff_state.files.iter().any(|f| f.path.starts_with(&prefix)) {
+                        Some("M".to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    diff_state.files.iter().find(|f| f.path == relative_path).map(|f| f.status.clone())
+                }
+            });
+
+            let name_color = if let Some(ref status) = git_status {
+                match status.as_str() {
+                    "M" => rgb(0xcca700).into(), // modified
+                    "A" | "??" => rgb(0x57c994).into(), // added/untracked
+                    "D" => rgb(0xf47067).into(), // deleted
+                    "U" => rgb(0xf47067).into(), // conflict
+                    _ => theme.foreground,
+                }
+            } else if is_modified {
+                rgb(0xcca700).into()
+            } else {
+                theme.foreground
+            };
 
             let chevron = if node.is_dir {
                 let icon_name = if node.is_expanded {
@@ -3509,13 +4268,58 @@ fn render_explorer(
                 } else {
                     IconName::Folder
                 };
+                let folder_color = if git_status.is_some() || is_modified {
+                    name_color
+                } else {
+                    theme.accent
+                };
                 Icon::new(icon_name)
                     .size_3p5()
-                    .text_color(theme.accent)
+                    .text_color(folder_color)
             } else {
+                let file_color = if git_status.is_some() || is_modified {
+                    name_color
+                } else {
+                    theme.muted_foreground
+                };
                 Icon::new(IconName::File)
                     .size_3p5()
-                    .text_color(theme.muted_foreground)
+                    .text_color(file_color)
+            };
+
+            let modified_badge = if !node.is_dir && is_modified {
+                div()
+                    .text_color(rgb(0xcca700))
+                    .font_bold()
+                    .text_xs()
+                    .pr_2()
+                    .child("●")
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            };
+
+            let git_badge = if !node.is_dir {
+                if let Some(ref status) = git_status {
+                    let badge_color = match status.as_str() {
+                        "M" => rgb(0xcca700).into(),
+                        "A" | "??" => rgb(0x57c994).into(),
+                        "D" => rgb(0xf47067).into(),
+                        "U" => rgb(0xf47067).into(),
+                        _ => theme.foreground,
+                    };
+                    div()
+                        .text_color(badge_color)
+                        .font_bold()
+                        .text_xs()
+                        .pr_2()
+                        .child(status.clone())
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                }
+            } else {
+                div().into_any_element()
             };
 
             let on_click_handler = cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -3533,7 +4337,22 @@ fn render_explorer(
                 }
             });
 
-            div()
+            let is_root = node.path == root_path;
+            let right_click_handler = {
+                let path_for_right_click = node.path.clone();
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    this.explorer_context_menu = Some(ExplorerContextMenu {
+                        tab_id,
+                        path: Some(path_for_right_click.clone()),
+                        position: event.position,
+                        is_root,
+                    });
+                    cx.stop_propagation();
+                    cx.notify();
+                })
+            };
+
+            let mut item_el = div()
                 .id(ElementId::Integer(4_000_000 + tab_id as u64 * 10_000 + idx as u64))
                 .w_full()
                 .h(px(22.))
@@ -3541,21 +4360,80 @@ fn render_explorer(
                 .flex()
                 .flex_row()
                 .items_center()
-                .cursor_pointer()
-                .hover(move |s| s.bg(theme.accent).text_color(theme.foreground))
-                .on_click(on_click_handler)
                 .child(chevron)
                 .child(item_icon)
-                .child(div().w(px(6.)))
-                .child(
-                    div()
-                        .flex_1()
-                        .overflow_hidden()
-                        .text_xs()
-                        .font_medium()
-                        .child(node.name),
-                )
-                .into_any_element()
+                .child(div().w(px(6.)));
+
+            if node.is_editing {
+                if let Some(edit_state) = tab_edit {
+                    item_el = item_el.child(
+                        Input::new(&edit_state.input_state)
+                            .flex_1()
+                            .xsmall()
+                            .font_family(theme.font_family.clone())
+                            .rounded(px(4.))
+                            .mr(px(6.))
+                    )
+                    .on_action(cx.listener(|this, _: &gpui_component::input::Escape, _window, cx| {
+                        this.explorer_edit = None;
+                        cx.notify();
+                    }));
+                } else {
+                    item_el = item_el.child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .truncate()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(name_color)
+                            .child(node.name)
+                    );
+                }
+            } else {
+                let drag_item = ExplorerDragItem {
+                    tab_id,
+                    path: node.path.clone(),
+                    is_dir: node.is_dir,
+                    name: node.name.clone(),
+                };
+                let drop_dest_dir = if node.is_dir {
+                    node.path.clone()
+                } else {
+                    node.path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| node.path.clone())
+                };
+                let on_drop_handler = {
+                    let drop_dest_dir = drop_dest_dir.clone();
+                    cx.listener(move |this, drag: &ExplorerDragItem, _window, cx| {
+                        this.move_explorer_item(tab_id, drag.path.clone(), drop_dest_dir.clone(), cx);
+                    })
+                };
+
+                item_el = item_el
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(theme.accent).text_color(theme.foreground))
+                    .on_click(on_click_handler)
+                    .on_mouse_down(MouseButton::Right, right_click_handler)
+                    .on_drag(drag_item, |drag, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| drag.clone())
+                    })
+                    .on_drop(on_drop_handler)
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .truncate()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(name_color)
+                            .child(node.name),
+                    )
+                    .child(modified_badge)
+                    .child(git_badge);
+            }
+
+            item_el.into_any_element()
         })
         .collect();
 
@@ -3589,6 +4467,24 @@ fn render_explorer(
                 .flex_1()
                 .overflow_y_scroll()
                 .py_1()
+                .on_mouse_down(MouseButton::Right, {
+                    let root_path_clone = root_path.clone();
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        this.explorer_context_menu = Some(ExplorerContextMenu {
+                            tab_id,
+                            path: Some(root_path_clone.clone()),
+                            position: event.position,
+                            is_root: true,
+                        });
+                        cx.notify();
+                    })
+                })
+                .on_drop({
+                    let root_path_clone = root_path.clone();
+                    cx.listener(move |this, drag: &ExplorerDragItem, _window, cx| {
+                        this.move_explorer_item(tab_id, drag.path.clone(), root_path_clone.clone(), cx);
+                    })
+                })
                 .children(items),
         )
         .into_any_element()
@@ -3600,6 +4496,8 @@ fn render_panel_content(
     dashboard_id: usize,
     panel_id: usize,
     dashboard_cwd: PathBuf,
+    dashboards: &HashMap<usize, DashboardState>,
+    original_contents: &HashMap<usize, String>,
     terminals: &HashMap<usize, Entity<TerminalModel>>,
     editors: &HashMap<usize, Entity<InputState>>,
     browsers: &HashMap<usize, BrowserState>,
@@ -3614,6 +4512,7 @@ fn render_panel_content(
     git_diff_div_scroll_handles: &std::cell::RefCell<HashMap<usize, gpui::ScrollHandle>>,
     terminal_settings: &TerminalSettings,
     layout_settings: &LayoutSettings,
+    explorer_edit: Option<&ExplorerEditState>,
     window: &mut Window,
     cx: &mut Context<DashboardView>,
 ) -> AnyElement {
@@ -3633,7 +4532,12 @@ fn render_panel_content(
                 dashboard_cwd,
                 terminal_cwds,
                 expanded_paths,
+                git_diffs,
                 layout_settings,
+                explorer_edit,
+                dashboards,
+                editors,
+                original_contents,
                 window,
                 cx,
             )
@@ -3656,7 +4560,12 @@ fn render_panel_content(
         }
         PanelContent::Editor { path, is_diff, status } => {
             if let Some(editor) = editors.get(&id) {
-                render_panel_editor(id, &path, editor, is_diff, status.as_deref(), git_diff_side_by_side, git_diff_wrap, git_diff_scroll_handles, git_diff_div_scroll_handles, layout_settings, window, cx)
+                let is_modified = if !is_diff {
+                    is_path_modified(&path, dashboards, editors, original_contents, cx)
+                } else {
+                    false
+                };
+                render_panel_editor(id, &path, editor, is_diff, status.as_deref(), git_diff_side_by_side, git_diff_wrap, git_diff_scroll_handles, git_diff_div_scroll_handles, layout_settings, is_modified, window, cx)
             } else {
                 div().flex_1().child("No editor").into_any_element()
             }
@@ -3996,6 +4905,7 @@ fn render_git(
                             div()
                                 .flex_1()
                                 .overflow_hidden()
+                                .truncate()
                                 .text_color(theme.foreground)
                                 .font_medium()
                                 .text_xs()
@@ -4067,6 +4977,7 @@ fn render_git(
                             div()
                                 .flex_1()
                                 .overflow_hidden()
+                                .truncate()
                                 .text_color(theme.foreground)
                                 .font_medium()
                                 .text_xs()
@@ -4211,6 +5122,15 @@ fn is_terminal_copy_shortcut(keystroke: &Keystroke) -> bool {
                 && !keystroke.modifiers.platform))
 }
 
+fn is_terminal_paste_shortcut(keystroke: &Keystroke) -> bool {
+    keystroke.key.eq_ignore_ascii_case("v")
+        && ((keystroke.modifiers.platform && !keystroke.modifiers.control && !keystroke.modifiers.alt)
+            || (keystroke.modifiers.control
+                && keystroke.modifiers.shift
+                && !keystroke.modifiers.alt
+                && !keystroke.modifiers.platform))
+}
+
 fn terminal_rows_to_text(rows: &[Vec<(char, u32, u32)>]) -> String {
     let mut lines = Vec::with_capacity(rows.len());
     for row in rows {
@@ -4312,10 +5232,34 @@ fn render_terminal(
     let term_entity_click = term.clone();
     let fh_click = focus_handle.clone();
     let fh_click_mouse_down = focus_handle.clone();
-    let term_font_family = terminal_settings.font_family.clone();
+    let term_font_family: SharedString = terminal_settings.font_family.clone().into();
     let term_font_size = terminal_settings.font_size;
     let term_line_height = terminal_settings.line_height;
-    let term_char_width = terminal_settings.char_width;
+    let term_char_width = {
+        let font = Font {
+            family: term_font_family.clone(),
+            weight: FontWeight::default(),
+            style: FontStyle::Normal,
+            features: FontFeatures::default(),
+            fallbacks: None,
+        };
+        let sample_text = "MMMMMMMMMM";
+        let text_run = TextRun {
+            len: sample_text.len(),
+            font,
+            color: rgb(0x000000).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line = _window.text_system().shape_line(
+            sample_text.into(),
+            px(term_font_size),
+            &[text_run],
+            None,
+        );
+        (line.width.as_f32() / sample_text.len() as f32).max(1.0)
+    };
     let resize_debounce_ms = terminal_settings.resize_debounce_ms;
 
     let list = uniform_list(
@@ -4327,9 +5271,10 @@ fn render_terminal(
                     render_term_row(
                         i,
                         &row_data_for_list[i],
-                        &term_font_family,
+                        term_font_family.clone(),
                         term_font_size,
                         term_line_height,
+                        term_char_width,
                         selection,
                     )
                 })
@@ -4345,6 +5290,44 @@ fn render_terminal(
         .size_full()
         .key_context("Terminal")
         .track_focus(&focus_handle)
+        .on_drop({
+            let term_entity = term.clone();
+            cx.listener(move |_this, drag: &ExplorerDragItem, _window, cx| {
+                let path_str = drag.path.to_string_lossy().to_string();
+                eprintln!("[debug] ExplorerDragItem dropped: {}", path_str);
+                let formatted_path = if path_str.contains(' ') {
+                    format!("'{}'", path_str.replace("'", "'\\''"))
+                } else {
+                    path_str
+                };
+                term_entity.update(cx, |m, _| {
+                    m.needs_attention = false;
+                    m.job_done = false;
+                    m.send_key(formatted_path.as_bytes());
+                    m.send_key(b" ");
+                });
+            })
+        })
+        .on_drop({
+            let term_entity = term.clone();
+            cx.listener(move |_this, drag: &gpui::ExternalPaths, _window, cx| {
+                eprintln!("[debug] gpui::ExternalPaths dropped: {:?}", drag.paths());
+                for path in drag.paths() {
+                    let path_str = path.to_string_lossy().to_string();
+                    let formatted_path = if path_str.contains(' ') {
+                        format!("'{}'", path_str.replace("'", "'\\''"))
+                    } else {
+                        path_str
+                    };
+                    term_entity.update(cx, |m, _| {
+                        m.needs_attention = false;
+                        m.job_done = false;
+                        m.send_key(formatted_path.as_bytes());
+                        m.send_key(b" ");
+                    });
+                }
+            })
+        })
         .on_click(move |_, window, cx| {
             window.focus(&fh_click, cx);
             crate::browser::restore_gpui_focus(window);
@@ -4464,6 +5447,19 @@ fn render_terminal(
                 cx.stop_propagation();
                 return;
             }
+            if is_terminal_paste_shortcut(&ks) {
+                if let Some(item) = cx.read_from_clipboard() {
+                    if let Some(text) = item.text() {
+                        if !text.is_empty() {
+                            term_entity.update(cx, |m, _| {
+                                m.send_key(text.as_bytes());
+                            });
+                        }
+                    }
+                }
+                cx.stop_propagation();
+                return;
+            }
             term_entity.update(cx, |m, _| {
                 let bytes = m.encode_keystroke(&ks);
                 if !bytes.is_empty() {
@@ -4517,9 +5513,10 @@ fn render_terminal(
 fn render_term_row(
     row_idx: usize,
     row: &[(char, u32, u32)],
-    term_font_family: &str,
+    term_font_family: SharedString,
     term_font_size: f32,
     term_line_height: f32,
+    _term_char_width: f32,
     selection: Option<((usize, usize), (usize, usize))>,
 ) -> AnyElement {
     if row.is_empty() {
@@ -4554,12 +5551,15 @@ fn render_term_row(
         .flex()
         .flex_row()
         .h(px(term_line_height))
+        .font_family(term_font_family.clone())
+        .text_size(px(term_font_size))
         .children(runs.into_iter().map(|(text, fg, bg)| {
             div()
-                .font_family(term_font_family)
+                .font_family(term_font_family.clone())
                 .text_size(px(term_font_size))
                 .text_color(rgb(fg))
                 .bg(rgb(bg))
+                .flex_shrink_0()
                 .child(text)
                 .into_any_element()
         }))
@@ -4815,17 +5815,23 @@ fn render_modal_editor(
 
                         div()
                             .flex_1()
-                            .p_2()
                             .overflow_hidden()
                             .child(list_element)
                     } else {
                         div()
                             .flex_1()
-                            .p_2()
                             .overflow_hidden()
+                            .on_action(cx.listener({
+                                let path = path.clone();
+                                let editor = editor.clone();
+                                move |this, _: &SaveFile, window, cx| {
+                                    this.save_modal_file(&path, &editor, window, cx);
+                                }
+                            }))
                             .child(
                                 Input::new(editor)
                                     .h_full()
+                                    .bordered(false)
                                     .font_family(theme.mono_font_family.clone())
                                     .text_size(theme.mono_font_size)
                                     .font_normal(),
@@ -5178,6 +6184,7 @@ fn render_panel_editor(
     git_diff_scroll_handles: &std::cell::RefCell<HashMap<usize, UniformListScrollHandle>>,
     git_diff_div_scroll_handles: &std::cell::RefCell<HashMap<usize, gpui::ScrollHandle>>,
     layout_settings: &LayoutSettings,
+    is_modified: bool,
     _window: &mut Window,
     cx: &mut Context<DashboardView>,
 ) -> AnyElement {
@@ -5195,19 +6202,35 @@ fn render_panel_editor(
         .items_center()
         .justify_between();
 
-    toolbar = toolbar.child(
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(Icon::new(IconName::File).size_3p5().text_color(theme.accent))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(relative_path)
-            )
-    );
+    let path_color = if is_modified {
+        rgb(0xcca700).into()
+    } else {
+        theme.muted_foreground
+    };
+
+    let mut path_row = div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(Icon::new(IconName::File).size_3p5().text_color(theme.accent))
+        .child(
+            div()
+                .text_xs()
+                .text_color(path_color)
+                .child(relative_path)
+        );
+
+    if is_modified {
+        path_row = path_row.child(
+            div()
+                .text_color(rgb(0xcca700))
+                .font_bold()
+                .text_xs()
+                .child(" ●")
+        );
+    }
+
+    toolbar = toolbar.child(path_row);
 
     if !is_diff {
         toolbar = toolbar.child(
@@ -5409,17 +6432,29 @@ fn render_panel_editor(
 
         div()
             .flex_1()
-            .p_2()
             .overflow_hidden()
             .child(list_element)
     } else {
+        let focus_handle = editor.focus_handle(cx);
         div()
             .flex_1()
-            .p_2()
             .overflow_hidden()
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                window.focus(&focus_handle, cx);
+                crate::browser::restore_gpui_focus(window);
+                cx.stop_propagation();
+            })
+            .on_action(cx.listener({
+                let path = path.clone();
+                let editor = editor.clone();
+                move |this, _: &SaveFile, window, cx| {
+                    this.save_modal_file(&path, &editor, window, cx);
+                }
+            }))
             .child(
                 Input::new(editor)
                     .h_full()
+                    .bordered(false)
                     .font_family(theme.mono_font_family.clone())
                     .text_size(theme.mono_font_size)
                     .font_normal(),

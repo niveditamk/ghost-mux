@@ -1,5 +1,6 @@
 mod browser;
 mod dashboard;
+mod hook_server;
 mod layout;
 mod persist;
 mod settings;
@@ -26,6 +27,7 @@ fn apply_reference_theme(settings: &ThemeSettings, cx: &mut App) {
     theme.muted = c(0x26292e);
     theme.accent = c(0x007acc);
     theme.accent_foreground = c(0xffffff);
+    theme.ring = theme.accent;
     theme.tab = c(0x1a1b1e);
     theme.tab_bar = c(0x1a1b1e);
     theme.tab_active = c(0x1f2329);
@@ -50,6 +52,7 @@ fn main() {
         Theme::change(ThemeMode::Dark, None, cx);
         apply_reference_theme(&settings.theme, cx);
         terminal::register_bindings(cx);
+        dashboard::register_bindings(cx);
 
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), |window, cx| {

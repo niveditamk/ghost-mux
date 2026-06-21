@@ -22,5 +22,5 @@ terminal:
   font_family: Menlo
   font_size: 12.0
   line_height: 21.0
-  char_width: 9.300003
+  char_width: 7.2
   resize_debounce_ms: 150

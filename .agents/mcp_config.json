@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "superset Docs": {
+      "serverUrl": "https://gitmcp.io/superset-sh/superset",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "disabled": false
+    }
+  }
+}

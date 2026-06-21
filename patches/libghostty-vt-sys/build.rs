@@ -97,10 +97,12 @@ fn main() {
         }
     }
 
-    // Zig-compiled static libraries on macOS need the C++ runtime and system frameworks.
+    // Zig-compiled static libraries on macOS and Linux need the C++ runtime.
     if target.contains("darwin") {
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        println!("cargo:rustc-link-lib=c++");
+    } else if target.contains("linux") {
         println!("cargo:rustc-link-lib=c++");
     }
     println!("cargo:include={}", include_dir.display());

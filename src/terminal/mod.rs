@@ -67,10 +67,11 @@ pub struct TerminalModel {
     pub last_output_time: std::time::Instant,
     pub process_ongoing: bool,
     pub job_done: bool,
+    pub running_agent: Option<String>,
 }
 
 impl TerminalModel {
-    pub fn new(cwd: Option<std::path::PathBuf>, cx: &mut Context<Self>) -> Self {
+    pub fn new(tab_id: usize, hook_port: Option<u16>, cwd: Option<std::path::PathBuf>, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
 
         // --- PTY ---
@@ -93,6 +94,19 @@ impl TerminalModel {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLUMNS", COLS.to_string());
         cmd.env("LINES", ROWS.to_string());
+
+        if let Some(port) = hook_port {
+            cmd.env("GHOST_MUX_HOOK_URL", &format!("http://127.0.0.1:{}/hook/{}", port, tab_id));
+            cmd.env("GHOST_MUX_TERMINAL_ID", &tab_id.to_string());
+            cmd.env("SUPERSET_HOST_AGENT_HOOK_URL", &format!("http://127.0.0.1:{}/hook/{}", port, tab_id));
+            cmd.env("SUPERSET_TERMINAL_ID", &tab_id.to_string());
+            cmd.env("SUPERSET_WORKSPACE_ID", "1");
+            cmd.env("SUPERSET_TAB_ID", &tab_id.to_string());
+            cmd.env("SUPERSET_PANE_ID", &tab_id.to_string());
+            if let Ok(home) = std::env::var("HOME") {
+                cmd.env("SUPERSET_HOME_DIR", &format!("{}/.ghost-mux", home));
+            }
+        }
 
         let child = pair
             .slave
@@ -220,6 +234,7 @@ impl TerminalModel {
             last_output_time: std::time::Instant::now(),
             process_ongoing: false,
             job_done: false,
+            running_agent: None,
         }
     }
 

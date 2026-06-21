@@ -2239,6 +2239,7 @@ dependencies = [
  "portable-pty",
  "raw-window-handle",
  "serde",
+ "serde_json",
  "serde_yaml",
 ]
 

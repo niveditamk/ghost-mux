@@ -8,6 +8,7 @@ pub struct AppSettings {
     pub theme: ThemeSettings,
     pub layout: LayoutSettings,
     pub terminal: TerminalSettings,
+    pub agents: Vec<AgentConfig>,
 }
 
 impl Default for AppSettings {
@@ -16,6 +17,26 @@ impl Default for AppSettings {
             theme: ThemeSettings::default(),
             layout: LayoutSettings::default(),
             terminal: TerminalSettings::default(),
+            agents: vec![
+                AgentConfig {
+                    name: "claude".to_string(),
+                    config_file: "~/.claude/settings.json".to_string(),
+                    hook_type: "nested".to_string(),
+                    enabled: true,
+                },
+                AgentConfig {
+                    name: "cursor".to_string(),
+                    config_file: "~/.cursor/hooks.json".to_string(),
+                    hook_type: "flat".to_string(),
+                    enabled: true,
+                },
+                AgentConfig {
+                    name: "gemini".to_string(),
+                    config_file: "~/.gemini/settings.json".to_string(),
+                    hook_type: "nested".to_string(),
+                    enabled: true,
+                },
+            ],
         }
     }
 }
@@ -117,4 +138,12 @@ impl Default for TerminalSettings {
             resize_debounce_ms: 150,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AgentConfig {
+    pub name: String,
+    pub config_file: String,
+    pub hook_type: String,
+    pub enabled: bool,
 }
