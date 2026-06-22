@@ -135,16 +135,16 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: ghost-mux-*
+          path: dist-release
           merge-multiple: true
 
       - name: List downloaded artifacts
-        run: ls -lh
+        run: ls -lh dist-release
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ghost-mux-linux-x86_64.tar.gz
-            ghost-mux-macos-arm64.tar.gz
+          files: dist-release/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
