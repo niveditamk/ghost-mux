@@ -93,6 +93,22 @@ You can use the helper shell scripts located in `tools/` depending on your opera
   ./tools/macos/run-production.sh
   ```
 
+### Running downloaded Release Bundles (macOS)
+
+If you download the pre-built application bundle (`ghost-mux-macos-arm64.zip`) directly from GitHub Releases, macOS Gatekeeper may block you from opening it, showing a message like **"Ghost-mux is damaged and cannot be opened. You should move it to the Trash."** or **"unidentified developer"**.
+
+This occurs because the downloaded ZIP file is flagged with the macOS `com.apple.quarantine` extended attribute, and the application is ad-hoc signed rather than signed and notarized via a paid Apple Developer Account.
+
+To fix this and run the app, you just need to clear the quarantine flag:
+
+1. Open **Terminal**.
+2. Run the following command (adjust the path if you didn't place the app in `/Applications`):
+   ```bash
+   xattr -cr /Applications/Ghost-mux.app
+   ```
+3. Launch **Ghost-mux** normally!
+
+
 #### Windows Development & Production Build (PowerShell)
 
 - **Ensure local Zig is cached**:

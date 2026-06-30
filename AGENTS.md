@@ -108,7 +108,7 @@ Dashboard panels can load different components represented by the [PanelContent]
 | [settings.yaml](file:///Users/saranyadamo/Downloads/ghost-mux/settings.yaml) | Runtime fonts, styling boundaries, radius configurations |
 | [dashboard_state.yaml](file:///Users/saranyadamo/Downloads/ghost-mux/dashboard_state.yaml) | Auto-generated persistence of layouts, tab mappings, and ratios |
 | [Todo.md](file:///Users/saranyadamo/Downloads/ghost-mux/Todo.md) | Ongoing roadmap goals (LSP support, Mobile, Syntax highlight, etc.) |
-| [README.md](file:///Users/saranyadamo/Downloads/ghost-mux/README.md) | User overview and instructions |
+| [README.md](file:///Users/saranyadamo/Downloads/ghost-mux/README.md) | User overview, instructions, and macOS Gatekeeper troubleshooting |
 | [patches/libghostty-vt-sys](file:///Users/saranyadamo/Downloads/ghost-mux/patches/libghostty-vt-sys) | Vendored bindings of `libghostty-vt` with a custom Zig-based [build.rs](file:///Users/saranyadamo/Downloads/ghost-mux/patches/libghostty-vt-sys/build.rs#L9) detecting the repo-local Zig compiler |
 | [patches/gpui-component](file:///Users/saranyadamo/Downloads/ghost-mux/patches/gpui-component) | Local component toolkit fork modifying panel restoring behavior |
 | [patches/gpui-component.patch](file:///Users/saranyadamo/Downloads/ghost-mux/patches/gpui-component.patch) | Git patch applied to upstream gpui-component repository |
@@ -119,7 +119,7 @@ Dashboard panels can load different components represented by the [PanelContent]
 | [tools/windows/ensure-zig.ps1](file:///Users/saranyadamo/Downloads/ghost-mux/tools/windows/ensure-zig.ps1) | PowerShell script installing local Zig |
 | [tools/windows/ensure-zig.cmd](file:///Users/saranyadamo/Downloads/ghost-mux/tools/windows/ensure-zig.cmd) | Windows Command Prompt wrapper for Zig setup |
 | [tools/linux/build-production.sh](file:///Users/saranyadamo/Downloads/ghost-mux/tools/linux/build-production.sh) | Production build pipeline for Linux/Git Bash |
-| [tools/macos/build-production.sh](file:///Users/saranyadamo/Downloads/ghost-mux/tools/macos/build-production.sh) | macOS packaging script for release bundles |
+| [tools/macos/build-production.sh](file:///Users/saranyadamo/Downloads/ghost-mux/tools/macos/build-production.sh) | macOS packaging script for release bundles, including ad-hoc code signing |
 | [tools/windows/build-production.ps1](file:///Users/saranyadamo/Downloads/ghost-mux/tools/windows/build-production.ps1) | Windows PowerShell release bundle compilation script |
 | [tools/windows/build-production.cmd](file:///Users/saranyadamo/Downloads/ghost-mux/tools/windows/build-production.cmd) | Command wrapper triggering release compile |
 | [tools/linux/run-production.sh](file:///Users/saranyadamo/Downloads/ghost-mux/tools/linux/run-production.sh) | Launch script for production build targets under Linux |
@@ -171,7 +171,7 @@ Zig is managed **inside this repo** — no system-wide install needed.
 ### Production Bundle
 
 The build scripts compile a `--release` binary, collect non-system runtime dylibs, and package the output:
-- **macOS**: Generates a native self-contained app bundle at `dist/Ghost-mux.app` complete with `Info.plist` and compiled `AppIcon.icns`.
+- **macOS**: Generates a native self-contained app bundle at `dist/Ghost-mux.app` complete with `Info.plist`, compiled `AppIcon.icns`, and ad-hoc code signs all libraries and binaries if the `codesign` tool is available.
 - **Linux**: Outputs a self-contained directory to `dist/ghost-mux/`.
 - **Windows**: Outputs to `dist/ghost-mux/`.
 
@@ -182,7 +182,7 @@ The build scripts compile a `--release` binary, collect non-system runtime dylib
 | [tools/windows/build-production.ps1](file:///Users/saranyadamo/Downloads/ghost-mux/tools/windows/build-production.ps1) | Windows PowerShell |
 | [tools/windows/build-production.cmd](file:///Users/saranyadamo/Downloads/ghost-mux/tools/windows/build-production.cmd) | Windows cmd (delegates to ps1) |
 
-macOS: packages the executable, libraries, settings, and icon into `dist/Ghost-mux.app`. On startup, if launched as a bundle (or from `/`), it pivots working directory to `~/Library/Application Support/ghost-mux` where it copies `settings.yaml` and saves layout state.
+macOS: packages the executable, libraries, settings, and icon into `dist/Ghost-mux.app`. If the `codesign` tool is available, it performs ad-hoc code signing on all libraries and binaries (including the overall bundle). On startup, if launched as a bundle (or from `/`), it pivots working directory to `~/Library/Application Support/ghost-mux` where it copies `settings.yaml` and saves layout state.
 Linux: uses `ldd` + `patchelf` (or `chrpath`, or a `run.sh` wrapper as fallback).  
 Windows: no bundling needed; PE binaries link against system DLLs.
 
@@ -195,7 +195,7 @@ Windows: no bundling needed; PE binaries link against system DLLs.
 | [tools/windows/run-production.ps1](file:///Users/saranyadamo/Downloads/ghost-mux/tools/windows/run-production.ps1) | Windows PowerShell |
 | [tools/windows/run-production.cmd](file:///Users/saranyadamo/Downloads/ghost-mux/tools/windows/run-production.cmd) | Windows cmd |
 
-macOS: launches the `Ghost-mux.app` bundle via macOS `open`.
+macOS: launches the `Ghost-mux.app` bundle via macOS `open`. Note that for pre-built release bundles downloaded directly from GitHub Releases, macOS Gatekeeper may block execution. The user can clear the quarantine attribute via `xattr -cr /Applications/Ghost-mux.app` to resolve this (see [README.md](file:///Users/saranyadamo/Downloads/ghost-mux/README.md) for more details).
 Linux: prefers `run.sh` wrapper inside the bundle (Linux fallback) over calling the binary directly.
 
 ---

@@ -99,5 +99,32 @@ else
     echo "warning: assets/logo.svg or assets/icon.jpg not found, App Bundle will not have custom icon."
 fi
 
+# 6. Ad-hoc Code Signing
+if command -v codesign &>/dev/null; then
+    echo "==> Ad-hoc code signing the macOS App Bundle..."
+    
+    # Sign libraries first
+    if [ -d "$MACOS_DIR/lib" ]; then
+        find "$MACOS_DIR/lib" -type f \( -name "*.dylib" -o -name "*.so" \) -exec codesign --force --sign - {} \;
+    fi
+    
+    # Sign nested helper binaries
+    if [ -f "$MACOS_DIR/ghost-mux-server" ]; then
+        codesign --force --sign - "$MACOS_DIR/ghost-mux-server"
+    fi
+    
+    # Sign the main binary
+    if [ -f "$MACOS_DIR/ghost-mux" ]; then
+        codesign --force --sign - "$MACOS_DIR/ghost-mux"
+    fi
+    
+    # Sign the overall bundle
+    codesign --force --sign - "$APP_BUNDLE"
+    echo "==> Code signing complete."
+else
+    echo "warning: codesign tool not found, skipping ad-hoc code signing."
+fi
+
 echo "==> Successfully created $APP_BUNDLE"
+
 
