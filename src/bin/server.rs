@@ -592,6 +592,56 @@ impl ServerState {
                 let stdout = String::from_utf8_lossy(&diff_output.stdout).into_owned();
                 Ok(serde_json::json!({ "diff": stdout }))
             }
+            "git.add" => {
+                let cwd = params.get("cwd").and_then(|c| c.as_str()).ok_or("Missing cwd")?;
+                let path = params.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+
+                let add_output = std::process::Command::new("git")
+                    .arg("add")
+                    .arg(path)
+                    .current_dir(cwd)
+                    .output()
+                    .map_err(|e| e.to_string())?;
+
+                if add_output.status.success() {
+                    Ok(serde_json::json!({ "success": true }))
+                } else {
+                    Err(String::from_utf8_lossy(&add_output.stderr).into_owned())
+                }
+            }
+            "git.commit" => {
+                let cwd = params.get("cwd").and_then(|c| c.as_str()).ok_or("Missing cwd")?;
+                let message = params.get("message").and_then(|m| m.as_str()).ok_or("Missing message")?;
+
+                let commit_output = std::process::Command::new("git")
+                    .arg("commit")
+                    .arg("-m")
+                    .arg(message)
+                    .current_dir(cwd)
+                    .output()
+                    .map_err(|e| e.to_string())?;
+
+                if commit_output.status.success() {
+                    Ok(serde_json::json!({ "success": true }))
+                } else {
+                    Err(String::from_utf8_lossy(&commit_output.stderr).into_owned())
+                }
+            }
+            "git.push" => {
+                let cwd = params.get("cwd").and_then(|c| c.as_str()).ok_or("Missing cwd")?;
+
+                let push_output = std::process::Command::new("git")
+                    .arg("push")
+                    .current_dir(cwd)
+                    .output()
+                    .map_err(|e| e.to_string())?;
+
+                if push_output.status.success() {
+                    Ok(serde_json::json!({ "success": true }))
+                } else {
+                    Err(String::from_utf8_lossy(&push_output.stderr).into_owned())
+                }
+            }
 
             // --- LSP Methods ---
             "lsp.start" => {

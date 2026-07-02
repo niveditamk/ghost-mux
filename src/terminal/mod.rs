@@ -547,6 +547,21 @@ impl TerminalModel {
         }
     }
 
+    pub fn paste(&mut self, text: &str) {
+        let bracketed_paste = self.terminal.mode(libghostty_vt::terminal::Mode::BRACKETED_PASTE).unwrap_or(false);
+        if bracketed_paste {
+            let mut payload = Vec::with_capacity(text.len() + 12);
+            payload.extend_from_slice(b"\x1b[200~");
+            payload.extend_from_slice(text.as_bytes());
+            payload.extend_from_slice(b"\x1b[201~");
+            self.send_key(&payload);
+        } else {
+            let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+            self.send_key(normalized.as_bytes());
+        }
+    }
+
+
     pub fn set_viewport_bounds(&mut self, bounds: Bounds<Pixels>) {
         self.viewport_bounds = Some(bounds);
     }

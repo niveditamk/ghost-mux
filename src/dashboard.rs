@@ -276,6 +276,7 @@ pub struct DashboardView {
     pub show_memory_stats: bool,
     pub settings_status: Option<String>,
     pub settings_path: PathBuf,
+    pub terminal_font_input: Entity<InputState>,
     /// Path where dashboard layout is persisted (alongside settings.yaml).
     pub persist_path: PathBuf,
     terminal_memory: HashMap<usize, TerminalMemoryStat>,
@@ -287,6 +288,7 @@ pub struct DashboardView {
     pub git_diff_side_by_side: HashMap<usize, bool>,
     pub git_diff_wrap: HashMap<usize, bool>,
     pub git_collapsed_paths: HashMap<usize, std::collections::HashSet<PathBuf>>,
+    pub git_commit_inputs: HashMap<usize, Entity<InputState>>,
     pub git_diff_scroll_handles: std::cell::RefCell<HashMap<usize, UniformListScrollHandle>>,
     pub git_diff_div_scroll_handles: std::cell::RefCell<HashMap<usize, gpui::ScrollHandle>>,
     pub tab_scroll_handles: std::cell::RefCell<HashMap<usize, gpui::ScrollHandle>>,
@@ -337,6 +339,11 @@ impl DashboardView {
         } else {
             None
         };
+        let terminal_font_input = cx.new(|cx| {
+            let mut e = InputState::new(window, cx).multi_line(false);
+            e.set_value(settings.terminal.font_family.clone(), window, cx);
+            e
+        });
         let mut view = Self {
             dashboards: HashMap::new(),
             dashboard_order: vec![],
@@ -353,6 +360,7 @@ impl DashboardView {
             show_memory_stats: false,
             settings_status: None,
             settings_path: PathBuf::from("settings.yaml"),
+            terminal_font_input,
             persist_path: persist_path.clone(),
             terminal_memory: HashMap::new(),
             memory_snapshot: MemorySnapshot::default(),
@@ -363,6 +371,7 @@ impl DashboardView {
             git_diff_side_by_side: HashMap::new(),
             git_diff_wrap: HashMap::new(),
             git_collapsed_paths: HashMap::new(),
+            git_commit_inputs: HashMap::new(),
             git_diff_scroll_handles: std::cell::RefCell::new(HashMap::new()),
             git_diff_div_scroll_handles: std::cell::RefCell::new(HashMap::new()),
             tab_scroll_handles: std::cell::RefCell::new(HashMap::new()),
@@ -437,6 +446,18 @@ impl DashboardView {
             });
         })
         .detach();
+
+        cx.subscribe(&view.terminal_font_input, move |this, input, event, cx| {
+            match event {
+                gpui_component::input::InputEvent::Change => {
+                    let val = input.read(cx).value().to_string();
+                    this.settings.terminal.font_family = val;
+                    cx.notify();
+                }
+                _ => {}
+            }
+        }).detach();
+
         view
     }
 
@@ -1106,6 +1127,7 @@ impl DashboardView {
     }
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings.terminal.font_family = self.terminal_font_input.read(cx).value().to_string();
         match self.settings.save_to_file(&self.settings_path) {
             Ok(()) => {
                 self.settings_status = Some("Saved settings.yaml".to_string());
@@ -1513,6 +1535,169 @@ impl DashboardView {
             self.git_diffs.insert(tab_id, new_state);
         }
         changed
+    }
+
+    pub fn git_add(&mut self, tab_id: usize, path: Option<String>, cx: &mut Context<Self>) {
+        let cwd = self.terminal_cwds.get(&tab_id).cloned().unwrap_or_else(|| {
+            if let Some(dashboard) = self.dashboards.get(&self.active_dashboard_id) {
+                dashboard.current_dir.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default()
+            }
+        });
+
+        let path_str = path.as_deref().unwrap_or(".");
+        let res = if let Some(ref url) = self.get_tab_server_url(tab_id, Some(&cwd)) {
+            let params = serde_json::json!({
+                "cwd": cwd.to_string_lossy().to_string(),
+                "path": path_str,
+            });
+            call_remote_api(url, "git.add", params)
+        } else {
+            let output = std::process::Command::new("git")
+                .arg("add")
+                .arg(path_str)
+                .current_dir(&cwd)
+                .output();
+            match output {
+                Ok(out) if out.status.success() => Ok(serde_json::json!({ "success": true })),
+                Ok(out) => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        match res {
+            Ok(_) => {
+                if let Some(state) = self.git_diffs.get_mut(&tab_id) {
+                    state.error = None;
+                }
+                self.refresh_git_diff(tab_id, cx);
+                cx.notify();
+            }
+            Err(e) => {
+                if let Some(state) = self.git_diffs.get_mut(&tab_id) {
+                    state.error = Some(format!("Git add failed: {}", e));
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn git_commit(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let commit_input = if let Some(input) = self.git_commit_inputs.get(&tab_id) {
+            input.clone()
+        } else {
+            return;
+        };
+
+        let message = commit_input.read(cx).text().to_string();
+        if message.trim().is_empty() {
+            if let Some(state) = self.git_diffs.get_mut(&tab_id) {
+                state.error = Some("Commit message cannot be empty".to_string());
+            }
+            cx.notify();
+            return;
+        }
+
+        let cwd = self.terminal_cwds.get(&tab_id).cloned().unwrap_or_else(|| {
+            if let Some(dashboard) = self.dashboards.get(&self.active_dashboard_id) {
+                dashboard.current_dir.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default()
+            }
+        });
+
+        if let Some(state) = self.git_diffs.get_mut(&tab_id) {
+            state.error = Some("Committing changes...".to_string());
+        }
+        cx.notify();
+
+        let res = if let Some(ref url) = self.get_tab_server_url(tab_id, Some(&cwd)) {
+            let params = serde_json::json!({
+                "cwd": cwd.to_string_lossy().to_string(),
+                "message": message,
+            });
+            call_remote_api(url, "git.commit", params)
+        } else {
+            let output = std::process::Command::new("git")
+                .arg("commit")
+                .arg("-m")
+                .arg(&message)
+                .current_dir(&cwd)
+                .output();
+            match output {
+                Ok(out) if out.status.success() => Ok(serde_json::json!({ "success": true })),
+                Ok(out) => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        match res {
+            Ok(_) => {
+                if let Some(state) = self.git_diffs.get_mut(&tab_id) {
+                    state.error = None;
+                }
+                commit_input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+                self.refresh_git_diff(tab_id, cx);
+                cx.notify();
+            }
+            Err(e) => {
+                if let Some(state) = self.git_diffs.get_mut(&tab_id) {
+                    state.error = Some(format!("Git commit failed: {}", e));
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn git_push(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let cwd = self.terminal_cwds.get(&tab_id).cloned().unwrap_or_else(|| {
+            if let Some(dashboard) = self.dashboards.get(&self.active_dashboard_id) {
+                dashboard.current_dir.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default()
+            }
+        });
+
+        if let Some(state) = self.git_diffs.get_mut(&tab_id) {
+            state.error = Some("Pushing changes...".to_string());
+        }
+        cx.notify();
+
+        let res = if let Some(ref url) = self.get_tab_server_url(tab_id, Some(&cwd)) {
+            let params = serde_json::json!({
+                "cwd": cwd.to_string_lossy().to_string(),
+            });
+            call_remote_api(url, "git.push", params)
+        } else {
+            let output = std::process::Command::new("git")
+                .arg("push")
+                .current_dir(&cwd)
+                .output();
+            match output {
+                Ok(out) if out.status.success() => Ok(serde_json::json!({ "success": true })),
+                Ok(out) => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        match res {
+            Ok(_) => {
+                if let Some(state) = self.git_diffs.get_mut(&tab_id) {
+                    state.error = None;
+                }
+                self.refresh_git_diff(tab_id, cx);
+                cx.notify();
+            }
+            Err(e) => {
+                if let Some(state) = self.git_diffs.get_mut(&tab_id) {
+                    state.error = Some(format!("Git push failed: {}", e));
+                }
+                cx.notify();
+            }
+        }
     }
 
     fn ensure_content_entity(
@@ -1931,6 +2116,7 @@ impl DashboardView {
             self.git_diff_side_by_side.remove(&tab_id);
             self.git_diff_wrap.remove(&tab_id);
             self.git_collapsed_paths.remove(&tab_id);
+            self.git_commit_inputs.remove(&tab_id);
             self.original_contents.remove(&tab_id);
             self.editor_subscriptions.remove(&tab_id);
             self.persist(cx);
@@ -2241,18 +2427,31 @@ impl DashboardView {
 
 
     fn render_panel(&mut self, dashboard_id: usize, panel_id: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
         let Some(dashboard) = self.dashboards.get(&dashboard_id) else {
+            let theme = cx.theme();
             return div().size_full().bg(theme.background).into_any_element();
         };
         let can_close = dashboard.layout.leaf_count() > 1;
         let Some(panel_tabs) = dashboard.panel_tabs.get(&panel_id) else {
+            let theme = cx.theme();
             return div().size_full().bg(theme.background).into_any_element();
         };
         let Some(active_tab) = panel_tabs.tabs.get(panel_tabs.active_tab) else {
+            let theme = cx.theme();
             return div().size_full().bg(theme.background).into_any_element();
         };
 
+        if let PanelContent::Git = active_tab.content {
+            self.git_commit_inputs.entry(active_tab.id).or_insert_with(|| {
+                cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .multi_line(false)
+                        .placeholder("Commit message...")
+                })
+            });
+        }
+
+        let theme = cx.theme();
         let is_editor_on = self.editor_panels.contains(&panel_id);
 
         let focus_handle = self
@@ -2347,6 +2546,7 @@ impl DashboardView {
                         &self.git_diff_side_by_side,
                         &self.git_diff_wrap,
                         &self.git_collapsed_paths,
+                        &self.git_commit_inputs,
                         &self.git_diff_scroll_handles,
                         &self.git_diff_div_scroll_handles,
                         &self.lsp_diagnostics,
@@ -4462,6 +4662,42 @@ fn settings_action_button(
         .into_any_element()
 }
 
+fn settings_text_row(
+    label: &'static str,
+    input_state: &Entity<InputState>,
+    theme: &gpui_component::theme::Theme,
+) -> AnyElement {
+    div()
+        .w_full()
+        .h(px(22.))
+        .flex()
+        .items_center()
+        .child(
+            div()
+                .flex_1()
+                .overflow_hidden()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(label),
+        )
+        .child(
+            div()
+                .w(px(100.))
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .child(
+                    Input::new(input_state)
+                        .xsmall()
+                        .h_full()
+                        .w_full()
+                        .bordered(true)
+                        .cleanable(false)
+                )
+        )
+        .into_any_element()
+}
+
 fn settings_number_row(
     label: &'static str,
     value: f32,
@@ -4704,6 +4940,11 @@ fn settings_panel(view: &DashboardView, cx: &mut Context<DashboardView>) -> AnyE
             }),
             theme,
             910_120,
+        ))
+        .child(settings_text_row(
+            "terminal.font_family",
+            &view.terminal_font_input,
+            theme,
         ))
         .child(
             div()
@@ -5707,6 +5948,7 @@ fn render_panel_content(
     git_diff_side_by_side: &HashMap<usize, bool>,
     git_diff_wrap: &HashMap<usize, bool>,
     git_collapsed_paths: &HashMap<usize, std::collections::HashSet<PathBuf>>,
+    git_commit_inputs: &HashMap<usize, Entity<InputState>>,
     git_diff_scroll_handles: &std::cell::RefCell<HashMap<usize, UniformListScrollHandle>>,
     git_diff_div_scroll_handles: &std::cell::RefCell<HashMap<usize, gpui::ScrollHandle>>,
     lsp_diagnostics: &HashMap<PathBuf, Vec<lsp_types::Diagnostic>>,
@@ -5758,6 +6000,7 @@ fn render_panel_content(
                 git_tree_view,
                 git_diff_side_by_side,
                 git_collapsed_paths,
+                git_commit_inputs,
                 layout_settings,
                 window,
                 cx,
@@ -6286,6 +6529,7 @@ fn render_git(
     git_tree_view: &HashMap<usize, bool>,
     _git_diff_side_by_side: &HashMap<usize, bool>,
     git_collapsed_paths: &HashMap<usize, std::collections::HashSet<PathBuf>>,
+    git_commit_inputs: &HashMap<usize, Entity<InputState>>,
     layout_settings: &LayoutSettings,
     _window: &mut Window,
     cx: &mut Context<DashboardView>,
@@ -6480,6 +6724,37 @@ fn render_git(
                     }
                 });
 
+                let stage_btn = if !is_dir {
+                    let relative_path_str = node.path.strip_prefix(&root_path)
+                        .unwrap_or(&node.path)
+                        .to_string_lossy()
+                        .to_string();
+                    let stage_click = cx.listener({
+                        let path = relative_path_str.clone();
+                        move |this, _: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.git_add(tab_id, Some(path.clone()), cx);
+                        }
+                    });
+                    Some(
+                        div()
+                            .id(ElementId::Integer(6_500_000 + tab_id as u64 * 10_000 + idx as u64))
+                            .w(px(20.))
+                            .h(px(20.))
+                            .mr_2()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(theme.accent.opacity(0.2)).text_color(theme.foreground))
+                            .on_click(stage_click)
+                            .child(Icon::new(IconName::Plus).size_3().text_color(theme.accent))
+                    )
+                } else {
+                    None
+                };
+
                 changes_section.push(
                     div()
                         .id(ElementId::Integer(5_500_000 + tab_id as u64 * 10_000 + idx as u64))
@@ -6507,6 +6782,7 @@ fn render_git(
                                 .text_xs()
                                 .child(node.name),
                         )
+                        .children(stage_btn)
                         .into_any_element()
                 );
             }
@@ -6548,6 +6824,27 @@ fn render_git(
                     }
                 });
 
+                let stage_click = cx.listener({
+                    let path = f.path.clone();
+                    move |this, _: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        this.git_add(tab_id, Some(path.clone()), cx);
+                    }
+                });
+
+                let stage_btn = div()
+                    .id(ElementId::Integer(6_000_000 + tab_id as u64 * 10_000 + idx as u64))
+                    .w(px(20.))
+                    .h(px(20.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(theme.accent.opacity(0.2)).text_color(theme.foreground))
+                    .on_click(stage_click)
+                    .child(Icon::new(IconName::Plus).size_3().text_color(theme.accent));
+
                 changes_section.push(
                     div()
                         .id(ElementId::Integer(5_000_000 + tab_id as u64 * 10_000 + idx as u64))
@@ -6579,6 +6876,7 @@ fn render_git(
                                 .text_xs()
                                 .child(f.path.clone())
                         )
+                        .child(stage_btn)
                         .into_any_element()
                 );
             }
@@ -6650,6 +6948,98 @@ fn render_git(
         }))
         .child("Tree");
 
+    let stage_all_btn = div()
+        .id(ElementId::Integer(5_400_000 + tab_id as u64))
+        .h(px(layout_settings.icon_button_height))
+        .px_2()
+        .rounded_sm()
+        .bg(theme.background)
+        .border_1()
+        .border_color(theme.border)
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_xs()
+        .font_medium()
+        .text_color(theme.muted_foreground)
+        .cursor_pointer()
+        .hover(move |s| s.text_color(theme.foreground).bg(theme.accent.opacity(0.15)).border_color(theme.accent))
+        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+            this.git_add(tab_id, None, cx);
+        }))
+        .child("Stage All");
+
+    let push_btn = div()
+        .id(ElementId::Integer(5_300_000 + tab_id as u64))
+        .h(px(layout_settings.icon_button_height))
+        .px_2()
+        .rounded_sm()
+        .bg(theme.background)
+        .border_1()
+        .border_color(theme.border)
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_xs()
+        .font_medium()
+        .text_color(theme.muted_foreground)
+        .cursor_pointer()
+        .hover(move |s| s.text_color(theme.foreground).bg(theme.accent.opacity(0.15)).border_color(theme.accent))
+        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+            this.git_push(tab_id, cx);
+        }))
+        .child("Push");
+
+    let commit_input_state = git_commit_inputs.get(&tab_id).cloned();
+    let commit_section = if let Some(input_state) = commit_input_state {
+        let commit_click = cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.git_commit(tab_id, window, cx);
+        });
+
+        let commit_input_el = Input::new(&input_state)
+            .flex_1()
+            .xsmall()
+            .font_family(theme.font_family.clone())
+            .rounded(px(4.));
+
+        let commit_btn = div()
+            .id(ElementId::Integer(7_100_000 + tab_id as u64))
+            .h(px(24.))
+            .px_3()
+            .rounded_sm()
+            .bg(theme.accent.opacity(0.15))
+            .border_1()
+            .border_color(theme.accent)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_xs()
+            .font_semibold()
+            .text_color(theme.accent)
+            .cursor_pointer()
+            .hover(move |s| s.bg(theme.accent).text_color(theme.foreground))
+            .on_click(commit_click)
+            .child("Commit");
+
+        div()
+            .w_full()
+            .p_2()
+            .bg(theme.secondary)
+            .border_t_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(commit_input_el)
+            .child(commit_btn)
+            .on_action(cx.listener(move |this, _: &gpui_component::input::Enter, window, cx| {
+                this.git_commit(tab_id, window, cx);
+            }))
+    } else {
+        div()
+    };
+
     div()
         .w_full()
         .h_full()
@@ -6700,10 +7090,13 @@ fn render_git(
                         .gap_2()
                         .child(flat_btn)
                         .child(tree_btn)
+                        .child(stage_all_btn)
+                        .child(push_btn)
                         .child(refresh_btn)
                 }),
         )
         .child(body)
+        .child(commit_section)
         .into_any_element()
 }
 
@@ -7050,7 +7443,7 @@ fn render_terminal(
                     if let Some(text) = item.text() {
                         if !text.is_empty() {
                             term_entity.update(cx, |m, _| {
-                                m.send_key(text.as_bytes());
+                                m.paste(&text);
                             });
                         }
                     }
@@ -7192,7 +7585,7 @@ fn render_term_row(
     term_font_family: SharedString,
     term_font_size: f32,
     term_line_height: f32,
-    _term_char_width: f32,
+    term_char_width: f32,
     selection: Option<((usize, usize), (usize, usize))>,
 ) -> AnyElement {
     if row.is_empty() {
@@ -7227,11 +7620,14 @@ fn render_term_row(
         .flex()
         .flex_row()
         .h(px(term_line_height))
+        .line_height(px(term_line_height))
         .font_family(term_font_family.clone())
         .text_size(px(term_font_size))
         .children(runs.into_iter().map(|(text, fg, bg)| {
+            let run_width = text.chars().count() as f32 * term_char_width;
             div()
                 .h_full()
+                .w(px(run_width))
                 .flex()
                 .items_center()
                 .font_family(term_font_family.clone())

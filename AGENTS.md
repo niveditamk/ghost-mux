@@ -29,7 +29,7 @@ VSplit { top, bottom, id }   — two panels stacked (resizable)
 - [HSplit](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L10): two panels side-by-side (resizable).
 - [VSplit](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L15): two panels stacked (resizable).
 
-Every node has a unique `usize` ID managed by [DashboardView::next_id](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L293).
+Every node has a unique `usize` ID managed by [DashboardView::next_id](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L295).
 
 ### State — [DashboardView](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L256)
 
@@ -38,32 +38,32 @@ Every node has a unique `usize` ID managed by [DashboardView::next_id](file:///U
 | Struct | Field | Type | Purpose |
 |---|---|---|---|
 | [DashboardState](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L50) | [layout](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L53) | [PanelLayout](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L8) | Root of the layout tree for the dashboard |
-| [DashboardView](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L256) | [next_id](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L293) | `usize` | Monotonically increasing ID counter for nodes and tabs |
+| [DashboardView](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L256) | [next_id](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L295) | `usize` | Monotonically increasing ID counter for nodes and tabs |
 
 Mutations:
 - **Layout Splits/Closes**:
-  - [split_panel](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L2063) — replace [Leaf](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L9) with an [HSplit](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L10) or [VSplit](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L15)
-  - [close_panel](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L2107) — remove [Leaf](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L9); sibling fills the space
+  - [split_panel](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L2249) — replace [Leaf](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L9) with an [HSplit](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L10) or [VSplit](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L15)
+  - [close_panel](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L2293) — remove [Leaf](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L9); sibling fills the space
 - **Tab Management**:
-  - [add_panel_tab](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L1844) — add a new tab to a panel
-  - [remove_panel_tab](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L1873) — remove a tab from a panel
-  - [switch_panel_tab](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L1941) — activate a different tab in a panel
-  - [set_panel_tab_content](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L1983) — set a tab's component content
+  - [add_panel_tab](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L2029) — add a new tab to a panel
+  - [remove_panel_tab](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L2058) — remove a tab from a panel
+  - [switch_panel_tab](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L2127) — activate a different tab in a panel
+  - [set_panel_tab_content](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L2169) — set a tab's component content
 - **Dashboard CRUD**:
-  - [add_dashboard](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L806) — add a new dashboard
-  - [switch_dashboard](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L815) — switch active dashboard
-  - [remove_dashboard](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L996) — delete a dashboard
+  - [add_dashboard](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L827) — add a new dashboard
+  - [switch_dashboard](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L836) — switch active dashboard
+  - [remove_dashboard](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L1017) — delete a dashboard
 
 Mutations trigger `cx.notify()` so GPUI re-renders.
 
-### Rendering — [render_layout](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L2151)
+### Rendering — [render_layout](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L2337)
 
 Recursively traverses the tree:
-- [Leaf](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L9) → [render_panel](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L2243) — shows panel content + toolbar
+- [Leaf](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L9) → [render_panel](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L2429) — shows panel content + toolbar
 - [HSplit](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L10) → [h_resizable](file:///Users/saranyadamo/Downloads/ghost-mux/patches/gpui-component/crates/ui/src/resizable/mod.rs#L15)(...) with two [resizable_panel](file:///Users/saranyadamo/Downloads/ghost-mux/patches/gpui-component/crates/ui/src/resizable/mod.rs#L25) children
 - [VSplit](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L15) → [v_resizable](file:///Users/saranyadamo/Downloads/ghost-mux/patches/gpui-component/crates/ui/src/resizable/mod.rs#L20)(...) with two [resizable_panel](file:///Users/saranyadamo/Downloads/ghost-mux/patches/gpui-component/crates/ui/src/resizable/mod.rs#L25) children
 
-Resizable split IDs are formed as `"h-{id}"` / `"v-{id}"` and must be unique across the whole tree (guaranteed because [DashboardView::next_id](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L293) is monotonic).
+Resizable split IDs are formed as `"h-{id}"` / `"v-{id}"` and must be unique across the whole tree (guaranteed because [DashboardView::next_id](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L295) is monotonic).
 
 ### Panel Toolbar
 
@@ -78,14 +78,14 @@ Buttons dispatch mutations via `cx.listener(move |this, _, _, cx| { ... })`.
 
 ## Panel Content & Components
 
-Dashboard panels can load different components represented by the [PanelContent](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L124) enum. Rendering is routed by [render_panel_content](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L5692) to the respective rendering functions:
+Dashboard panels can load different components represented by the [PanelContent](file:///Users/saranyadamo/Downloads/ghost-mux/src/layout.rs#L124) enum. Rendering is routed by [render_panel_content](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L5933) to the respective rendering functions:
 
-- **Terminal**: Handled via [TerminalModel](file:///Users/saranyadamo/Downloads/ghost-mux/src/terminal/mod.rs#L39) which manages the PTY stream. Rendered via [render_terminal](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L6799) using `libghostty-vt` for terminal emulation.
-- **FileExplorer**: Built-in tree explorer rendered via [render_explorer](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L5365) supporting file tree actions (create, delete, rename).
-- **Git**: Sidebar/split component rendered via [render_git](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L6279) to track file diffs and tree changes.
+- **Terminal**: Handled via [TerminalModel](file:///Users/saranyadamo/Downloads/ghost-mux/src/terminal/mod.rs#L39) which manages the PTY stream. Rendered via [render_terminal](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L7192) using `libghostty-vt` for terminal emulation.
+- **FileExplorer**: Built-in tree explorer rendered via [render_explorer](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L5606) supporting file tree actions (create, delete, rename).
+- **Git**: Sidebar/split component rendered via [render_git](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L6522) to track file diffs and tree changes.
 - **Browser**: Integrates Cocoa's WKWebView wrapper [WebViewHandle](file:///Users/saranyadamo/Downloads/ghost-mux/src/browser.rs#L79) for macOS environments.
-- **Editor**: Text/code file editor rendered via [render_panel_editor](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L7855) with file state management, file save/editing, and diff modes (supporting [render_modal_editor](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L7252), [render_side_by_side_line](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L7662), and [render_inline_diff_line](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L7808)). LSP-backed autocompletion, definitions, and hover actions are powered by [LspClient](file:///Users/saranyadamo/Downloads/ghost-mux/src/lsp.rs#L31) using [GhostCompletionProvider](file:///Users/saranyadamo/Downloads/ghost-mux/src/lsp.rs#L351), [GhostHoverProvider](file:///Users/saranyadamo/Downloads/ghost-mux/src/lsp.rs#L405), and [GhostDefinitionProvider](file:///Users/saranyadamo/Downloads/ghost-mux/src/lsp.rs#L443).
-- **Diagnostics**: Workspace diagnostics panel rendered via [render_diagnostics_panel](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L5903) displaying code compilation warnings and errors.
+- **Editor**: Text/code file editor rendered via [render_panel_editor](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L8251) with file state management, file save/editing, and diff modes (supporting [render_modal_editor](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L7648), [render_side_by_side_line](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L8058), and [render_inline_diff_line](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L8204)). LSP-backed autocompletion, definitions, and hover actions are powered by [LspClient](file:///Users/saranyadamo/Downloads/ghost-mux/src/lsp.rs#L31) using [GhostCompletionProvider](file:///Users/saranyadamo/Downloads/ghost-mux/src/lsp.rs#L351), [GhostHoverProvider](file:///Users/saranyadamo/Downloads/ghost-mux/src/lsp.rs#L405), and [GhostDefinitionProvider](file:///Users/saranyadamo/Downloads/ghost-mux/src/lsp.rs#L443).
+- **Diagnostics**: Workspace diagnostics panel rendered via [render_diagnostics_panel](file:///Users/saranyadamo/Downloads/ghost-mux/src/dashboard.rs#L6146) displaying code compilation warnings and errors.
 
 ---
 
