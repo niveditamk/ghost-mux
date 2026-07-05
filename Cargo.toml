@@ -22,6 +22,7 @@ lsp-types = "0.97.0"
 futures = "0.3"
 async-channel = "2.5"
 url = "2.5"
+ureq = { version = "2.9.7", features = ["tls", "json"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

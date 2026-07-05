@@ -1,58 +1,26 @@
-use std::io::{Read, Write, BufReader, BufRead};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use serde_json::Value;
 
-/// Performs a synchronous JSON-RPC POST call over HTTP to the headless server.
+/// Performs a synchronous JSON-RPC POST call over HTTP/HTTPS to the headless server.
 pub fn call_remote_api(server_url: &str, method: &str, params: Value) -> Result<Value, String> {
-    let addr = if server_url.starts_with("http://") {
-        server_url.trim_start_matches("http://")
-    } else {
-        server_url
-    };
-
-    let mut stream = TcpStream::connect(addr)
-        .map_err(|e| format!("Failed to connect to headless server at {}: {}", addr, e))?;
+    let mut url = server_url.to_string();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        url = format!("http://{}", url);
+    }
 
     let req = serde_json::json!({
         "method": method,
         "params": params,
     });
-    let body = serde_json::to_string(&req).map_err(|e| e.to_string())?;
 
-    let request = format!(
-        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        addr, body.len(), body
-    );
+    let resp = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(req)
+        .map_err(|e| format!("HTTP request to {} failed: {}", url, e))?;
 
-    stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
-    stream.flush().map_err(|e| e.to_string())?;
+    let resp_val: Value = resp.into_json()
+        .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
 
-    let mut reader = BufReader::new(stream);
-    let mut headers = Vec::new();
-    let mut content_length = 0;
-
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).map_err(|e| e.to_string())?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break;
-        }
-        headers.push(line.clone());
-        if line.to_lowercase().starts_with("content-length:") {
-            if let Some(len_str) = line.split(':').nth(1) {
-                if let Ok(len) = len_str.trim().parse::<usize>() {
-                    content_length = len;
-                }
-            }
-        }
-    }
-
-    let mut body_buf = vec![0u8; content_length];
-    reader.read_exact(&mut body_buf).map_err(|e| e.to_string())?;
-
-    let resp_val: Value = serde_json::from_slice(&body_buf).map_err(|e| e.to_string())?;
     if let Some(status) = resp_val.get("status").and_then(|s| s.as_str()) {
         if status == "success" {
             if let Some(res) = resp_val.get("result") {
